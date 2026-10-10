@@ -1,0 +1,9 @@
+# 开发期临时产物
+node_modules/
+*.tgz
+
+# 本仓库内脚本编辑时留下的临时文件
+.readme.bak
+.section*.tmp
+.sa-*.tmp
+.p*.cjs

@@ -1,34 +1,53 @@
 # dsh-selection-annotations
 
-DSH Web 滑词批注插件：**选中文字 → 批注 → 随消息以独立 JSON 数据块提交**。
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-关键约束（本插件的存在理由）：批注**不写进消息正文**。
-不使用「把批注块拼进草稿、发送后再从气泡里藏掉」那类做法 —— 本插件让批注成为
-消息里一个**真实存在、位置独立**的 content 块，正文与批注在协议层就是两件事。
+> Select text anywhere in the DSH Web UI — an assistant reply, a workspace file, a message from
+> an earlier conversation — leave a note, and send the whole set with your next message as a
+> **separate, machine-readable JSON block**. Your message text is never touched.
 
-## 能力
+A plugin for [DeepSeek Harness](https://github.com/deepseek-ai) (DSH). Zero dependencies,
+zero changes to DSH itself.
 
-| 能力 | 说明 |
+## Why not just append the notes to the prompt?
+
+The obvious way to ship "select text → annotate" in a chat UI is to append the annotation block
+to the composer draft at submit time, then hide it again in the rendered bubble. It looks right,
+but the model still receives **one** text block with your notes glued into your prose, and your
+bubble is rewritten by a DOM script after the fact.
+
+This plugin puts the annotations on the message as a real content block instead:
+
+| | draft-text injection | **this plugin** |
+|---|---|---|
+| message `content` | `[{type:'text'}]` | `[{type:'text'}, {type:'file'}]` |
+| what the model receives | your prose with notes inline | your text, **then a separate JSON message** |
+| your own bubble | rewritten post-send | untouched |
+| position data | free-form text | `lineStart/lineEnd`, `charStart/charEnd`, `anchorKey` |
+
+## Features
+
+| Feature | Detail |
 |---|---|
-| 选中即批注 | 在任意会话（含更早的会话）的回复/消息，以及工作区文件预览里选中文字 → 浮动「批注」按钮 → 写批注（可留空，仅标记原文） |
-| 原文高亮 + 编号角标 | 淡黄色叠加高亮 + 蓝色编号角标，按语义 `data-*` 锚点定位；滚动/换视图后按「字符区间 + 引用上下文」重建 |
-| **点角标 = 改这条批注** | 角标可点击，直接打开该条批注的修改弹层（可改批注文字、可删除）；批注列表里也有「编辑」入口 |
-| 位置精确到区间 | 每条批注记录 `charStart`/`charEnd`（半开区间，以锚点元素 `textContent` 为口径）；文件来源另记 1 基 `lineStart`/`lineEnd` 与 `path` |
-| 触发按钮在发送按钮旁 | 注册进 `conversation.input.right`，只占一个紧凑控件位，**不影响输入框布局** |
-| 批注面板悬浮 | 「批注 ×N」点开的面板是挂在 `body` 上的 `position: fixed` 原生 DOM，**完全脱离文档流**，不会把输入框顶上去 |
-| 独立块随消息发送 | 批注集合包成一个 `File`（`批注.json`），交给运行时自己的 `createDrafts` + 输入外壳的 `addFiles`（拖拽/粘贴附件走的就是这条链路），等 `status === ready` 才挂上 |
-| 模型侧独立消息 | 宿主半边在 `agent/pre-step` 把该附件块从模型可见内容里摘掉，紧随其后追加一条独立 user 消息，正文就是那份 JSON |
-| 发送后自动消费 | 附件被消息消费（或用户手动摘掉）后，这批批注自动清空，不会黏到下一条消息 |
+| Select to annotate | Assistant replies, user messages, and workspace file previews. The note may be empty — that just marks the quote. |
+| Highlight + numbered badge | Light-yellow overlay plus a numbered badge, anchored on semantic `data-*` attributes. Re-located after scroll or re-render by character range + quote context. |
+| **Click the badge to edit** | Clicking a badge opens *that* annotation for editing (change the note, or delete it). The list panel has the same entry point. |
+| Precise positions | Every annotation records `charStart`/`charEnd` (a half-open range over the anchor element's `textContent`). File sources additionally record 1-based `lineStart`/`lineEnd` and the workspace-relative `path`. |
+| Trigger next to Send | Registered into `conversation.input.right`, so it occupies one compact control slot and never disturbs the composer layout. |
+| Floating panel | The "批注 ×N" panel is plain DOM appended to `body` with `position: fixed` — it is completely out of flow and never pushes the input box around. |
+| Sent as a separate block | The annotation set is packed into a `File` (`批注.json`) and handed to the runtime's own `createDrafts` + the input shell's `addFiles` — the exact path drag-and-drop attachments use. It is attached only once the upload reports `ready`. |
+| Separate message for the model | The host half strips that file block from the model-visible content during `agent/pre-step` and appends an independent user message whose body is the JSON. |
+| Consumed on send | Once the attachment is consumed (or manually removed), the set clears — it never sticks to the next message. |
 
-## 负载格式
+## Payload format
 
-一条独立消息，正文是一份自描述 JSON 数据块：
+The model receives one extra message whose entire body is a self-describing JSON block:
 
 ```json
 {
   "kind": "dsh-selection-annotations",
   "version": 1,
-  "instruction": "这是用户随上一条消息附加的批注数据块，与用户消息正文是相互独立的两部分……",
+  "instruction": "This is an annotation block the user attached to the previous message. It is separate from, and not part of, the user's message text. annotations[].quote is the text the user selected; annotations[].source gives its position ...",
   "count": 2,
   "annotations": [
     {
@@ -38,10 +57,10 @@ DSH Web 滑词批注插件：**选中文字 → 批注 → 随消息以独立 JS
       "source": {
         "kind": "file",
         "path": "dsh-selection-annotations/client.js",
-        "lineStart": 1,
-        "lineEnd": 3,
-        "charStart": 123,
-        "charEnd": 127
+        "lineStart": 4,
+        "lineEnd": 4,
+        "charStart": 126,
+        "charEnd": 130
       }
     },
     {
@@ -51,7 +70,7 @@ DSH Web 滑词批注插件：**选中文字 → 批注 → 随消息以独立 JS
       "source": {
         "kind": "message",
         "role": "assistant",
-        "anchorKey": "assistant-step:12",
+        "anchorKey": "14:assistant-step6:12",
         "flowKind": "assistant-step",
         "charStart": 40,
         "charEnd": 46
@@ -61,128 +80,171 @@ DSH Web 滑词批注插件：**选中文字 → 批注 → 随消息以独立 JS
 }
 ```
 
-要点：
+Notes on the contract:
 
-- **用 JSON 而不是 Markdown**：位置是要被程序化使用的东西（行号、字符区间、锚点键），结构化字段才不会在自然语言里糊掉。
-- `charStart`/`charEnd` 是**半开区间** `[charStart, charEnd)`，以该锚点元素正文的 `textContent` 为口径 —— 引文可能重复，字符区间不会。
-- 宿主**按内容认领**：读出来的 JSON 必须带 `kind: "dsh-selection-annotations"`；文件名只用于快速预筛，改名也能正常工作。
-- 多条批注附件会合并成一份，`index` 重新编号成 `1..N`。
+- **JSON, not prose.** Positions are things a program consumes — line numbers, character
+  ranges, anchor keys. Structured fields do not get lost in natural language.
+- `charStart`/`charEnd` is a **half-open range** `[charStart, charEnd)` measured over the anchor
+  element's `textContent`. A quote can repeat; a character range cannot.
+- `lineStart`/`lineEnd` are **1-based** and only present for workspace file sources.
+- The host claims the payload **by content**: the parsed JSON must carry
+  `kind: "dsh-selection-annotations"`. The file name is only a cheap pre-filter, so renaming the
+  attachment still works.
+- Multiple annotation attachments are merged into one block and `index` is renumbered `1..N`.
 
-## 数据流
+## Install
 
-```
-选区 ──▶ 批注记录 {原文, 出处, 行号/字符区间, 批注}
-                    │
-                    ├─ 本地：淡黄高亮 + 编号角标 + 悬浮面板列表（点角标改这一条）
-                    │
-                    └─ 防抖 450ms ──▶ new File([JSON], '批注.json')
-                                            │
-                                            ▼
-                    conversation.createDrafts(sessionId, [file])  ← 运行时登记草稿附件 + 后台上传
-                                            │  等 fileUploads[id].status === "ready"
-                                            ▼
-                              shell.addFiles([], [draftId])
-                                            │
-用户正文 + 批注附件 = 一条消息的 content = [ {type:'text'}, {type:'file'} ]
-                                            │
-                                            ▼
-            宿主 agent/pre-step：摘掉 file 块 ──▶ 追加独立 user 消息（正文 = 那份 JSON）
-                                            │
-                                            ▼
-                        模型收到：用户正文（一条） + 批注 JSON（另一条），互不混杂
+```sh
+dsh plugin --profile <profile> add dsh-selection-annotations
 ```
 
-## 为什么这样接
+Or install the directory directly with DSH's plugin manager:
 
-DSH 的 `session.prompt` 请求 schema 是**封闭三元组** `text | image | file`
-（`dsh-api-session-controller`），自定义 content 块进不去；而 `dsh-llm-deepseek`
-对未知的用户块直接抛 `UNSUPPORTED_CONTENT`。所以「让模型看到自定义块」这条路必须绕开
-content 块类型本身 —— 官方可用的 seam 是 `agent/pre-step` waterfall
-（`@deepseek-ai/dsh-session-reference` 的跨会话 recall 用的正是它）。
+```
+plugin_manager  action: install_bundle  target: <absolute path to this directory>
+```
 
-于是本插件用 `file` 块做**客户端 → 宿主 → 模型**的载体：
-UI 侧它天然渲染成独立卡片，宿主侧再把它换成一条独立消息。
+Installing with `link:` from a source checkout is how this plugin is developed — see
+[Development](#development).
 
-**踩过的坑（务必不要再走回头路）**：
+## How it works
 
-1. 只调 `inputActions.addAttachments(ids)` 是不够的 —— 它只往输入态里塞 id，运行时私有的
-   `draftAttachments` 里并没有对应条目，发送时 `resolveDraftAttachments` 解析不到，结果是
-   批注根本进不了消息（或直接抛错）。必须让运行时自己登记草稿附件：
-   `conversation.createDrafts(sessionId, [file])` → `shell.addFiles([], ids)`。
-2. 上传没就绪就挂载，`sendSession` 会抛「one or more files have not finished uploading」而让
-   **整条消息**发送失败。所以要等 `fileUploads[id].status === 'ready'`。
-3. 自己摘旧附件时必须屏蔽消费检测，否则会被误判成「消息已发送」而清空批注。
-4. **`link:` 安装的插件不能静态 import `@deepseek-ai/*`**：模块解析按插件的**真实路径**（工作区）
-   进行，工作区没有 `node_modules`，这些包一律解析不到；静态导入会让宿主半边加载失败
-   （`fiberPhase` 停在 `null`），而 UI 上表现为「功能整个消失」。需要宿主包时，要么把插件从 npm
-   装进 profile（真实路径在 profile 下就能解析），要么别用那个包。
+```
+selection ──▶ annotation { quote, source, note }
+                    │
+                    ├─ locally: highlight + numbered badge + floating panel
+                    │
+                    └─ debounced 450ms ──▶ new File([JSON], '批注.json')
+                                                │
+                                                ▼
+                        conversation.createDrafts(sessionId, [file])
+                                                │  wait for fileUploads[id].status === "ready"
+                                                ▼
+                                  shell.addFiles([], [draftId])
+                                                │
+   user text + annotation attachment = one message with content [ {type:'text'}, {type:'file'} ]
+                                                │
+                                                ▼
+        host `agent/pre-step`: drop the file block ──▶ append a separate user message (the JSON)
+                                                │
+                                                ▼
+              model receives: your text (one message) + the annotation JSON (another), unmixed
+```
 
-## 配置
+### Why this seam
 
-| 键 | 默认 | 说明 |
+DSH's `session.prompt` request schema is a **closed union** of `text | image | file`
+(`dsh-api-session-controller`), so a plugin cannot introduce a custom content block type; and
+`dsh-llm-deepseek` throws `UNSUPPORTED_CONTENT` on unknown user blocks. The supported way to get
+plugin-authored content in front of the model is the `agent/pre-step` waterfall — the same seam
+`@deepseek-ai/dsh-session-reference` uses for cross-session recall.
+
+So the plugin uses a `file` block as the carrier: the UI already renders it as its own card, and
+the host half turns it into its own message.
+
+### Pitfalls worth knowing
+
+1. **`addAttachments(ids)` alone is not enough.** It only appends ids to the input state; the
+   runtime's private `draftAttachments` map has no matching entry, so `resolveDraftAttachments`
+   fails at send time and the annotation never reaches the message. Let the runtime register the
+   draft itself: `conversation.createDrafts(sessionId, [file])` → `shell.addFiles([], ids)`.
+2. **Attaching before the upload is ready breaks the whole send.** `sendSession` throws
+   "one or more files have not finished uploading". Wait for `fileUploads[id].status === 'ready'`.
+3. **Releasing your own attachment must be masked from the consumption watcher**, otherwise the
+   removal is mistaken for "the message was sent" and the annotation set is cleared.
+4. **A `link:`-installed plugin cannot statically import `@deepseek-ai/*`.** Module resolution
+   follows the plugin's real path (your source checkout), which has no `node_modules`, so those
+   specifiers fail to resolve; a static import makes the whole host half fail to load
+   (`fiberPhase` stays `null`) and the feature silently disappears from the UI. This plugin
+   therefore imports nothing.
+
+## Configuration
+
+| Key | Default | Meaning |
 |---|---|---|
-| `maxPayloadBytes` | `524288` | 单个批注附件读取上限（字节）；超过视为无效负载，整条消息原样放行（绝不截半份数据给模型） |
+| `maxPayloadBytes` | `524288` | Read cap for a single annotation attachment. A payload above it is treated as invalid and the message passes through untouched (never a truncated half-block). |
 
-本插件**没有** `export const Config`（因此 Plugins 页面里没有对应的 schema 表单）。原因见下：
-它是以 `link:` 装进 profile 的，而 schema 需要 `@deepseek-ai/schemastery` —— 那个导入在 `link:` 场景下
-解析不到，会让整个宿主半边加载失败。要在 profile patch 里改这项仍然可以写
-`config: { maxPayloadBytes: … }`：`apply(ctx, config)` 照常收到它。
+The plugin deliberately does **not** export a `Config` schema — that would require importing
+`@deepseek-ai/schemastery`, which breaks `link:` installs (pitfall 4 above). You can still set
+the option from a profile patch entry; `apply(ctx, config)` receives it as usual:
 
-## 安装
+```yaml
+- id: selection-annotations
+  config:
+    maxPayloadBytes: 1048576
+```
 
-由 DSH 的 `plugin_manager` 安装到当前 profile：`action: install_bundle`，`target` 为本目录绝对路径。
-本插件以 `link:` 形式装进 profile，改动即时反映到文件。
+## Troubleshooting
 
-## 开发期的重载语义（重要）
+In the browser console:
 
-| 半边 | 改完怎么生效 |
+```js
+window.__dshSelectionAnnotations.list()      // current annotation set
+window.__dshSelectionAnnotations.payload()   // the JSON block about to be submitted (string)
+window.__dshSelectionAnnotations.drafts()    // attached draft ids — [] means nothing is attached
+window.__dshSelectionAnnotations.receipt()   // same, first id only
+window.__dshSelectionAnnotations.session()   // resolved current session id
+window.__dshSelectionAnnotations.add({...})  // add one by hand (debugging)
+window.__dshSelectionAnnotations.update(id, note)  // edit one by hand (debugging)
+```
+
+`drafts()` is the hard indicator: an empty array means the annotations will **not** ride the next
+message, whatever the UI looks like.
+
+Warnings from the plugin are prefixed `[selection-annotations]`.
+
+## Known limitations
+
+- The **quote and source of an annotation cannot be edited** — only the note text, or delete and
+  re-annotate.
+- **Markdown previews have no line numbers.** Code previews fall back to the `.line` index and
+  plain-text previews use `data-textpreview-line`, but a rendered Markdown document has neither,
+  so those annotations carry a character range only.
+- Anchoring depends on semantic `data-*` attributes (`data-chat-anchor-key`,
+  `data-chat-flow-kind`, `data-textpreview-url`, `data-code-preview`). If DSH renames them, the
+  anchor layer in `client.js` needs updating.
+- Character ranges are measured against the anchor element's `textContent`. If DSH changes what a
+  message row renders, previously recorded ranges go stale and location falls back to
+  quote + surrounding context.
+- Conversation messages carry character ranges but no line numbers: after Markdown rendering, a
+  visual line number is not a stable coordinate.
+
+## Development
+
+```sh
+npm test
+```
+
+The suite runs in plain Node — no browser, no DSH install:
+
+- `test/host-pre-step.test.mjs` — host half: stripping the file block, appending the JSON message,
+  content-based claiming, merging, config branches.
+- `test/client-half.test.mjs` — a minimal DOM + React + Cordis harness around `client.js` that
+  drives the whole data path (annotation → JSON payload → runtime draft attachment → input state →
+  cleared after send) plus anchor re-location and character-range capture.
+- `test/loader.mjs` / `test/schemastery-shim.mjs` — resolve `@deepseek-ai/schemastery` to a local
+  stub so tests can run outside the host. Currently inert (the plugin imports nothing) but kept so
+  that re-adding a host-side schema would not break local tests.
+
+Reload behaviour while developing:
+
+| Half | How a change takes effect |
 |---|---|
-| 客户端 `client.js` | `@deepseek-ai/dsh-client-hmr` 500ms 轮询热换，**刷新页面即生效**，不需重启 |
-| 宿主 `lib/index.js`（已成功加载过） | **不会热重载**。disable→enable、`remove_bundle` + `install_bundle` 都换不掉（Node ESM 模块缓存），必须**重启宿主进程** |
-| 宿主 `lib/index.js`（**加载失败过**，`fiberPhase` 为 `null`） | 修好后做一次 disable→enable 即可**立即生效** —— 从未启动成功的 fiber 会重新 import |
+| Client `client.js` | Hot-swapped by `@deepseek-ai/dsh-client-hmr` (~500ms poll). **Refresh the page.** |
+| Host `lib/index.js`, already loaded once | **Does not hot-reload.** Neither disable→enable nor `remove_bundle` + `install_bundle` helps (Node ESM module cache). **Restart the host process.** |
+| Host `lib/index.js`, previously failed to load (`fiberPhase: null`) | A single disable→enable re-imports it — **takes effect immediately** |
 
-判断宿主半边到底在不在跑：`plugin_manager list_plugins` 看该条的 `fiberPhase` ——
-`active` = 在跑；`null` = 加载失败（此时**客户端半边也会一起消失**，UI 上看就是功能没了）。
+To tell whether the plugin is actually running, check `fiberPhase` for its entry in
+`plugin_manager list_plugins`: `active` means running, `null` means the module failed to load
+(and the client half disappears with it).
 
-想在本地直接复现宿主的模块解析（不重启也能验），在 profile 目录里跑：
+To reproduce the host's module resolution locally, run this from the profile directory:
 
-```powershell
-cd $env:DSH_PROFILE_DIR
+```sh
+cd "$DSH_PROFILE_DIR"
 node --input-type=module -e "import('dsh-selection-annotations').then(m => console.log('OK', Object.keys(m))).catch(e => console.error('FAIL', e.message))"
 ```
 
-## 测试
+## License
 
-```powershell
-npm test    # 等于：node --import ./test/loader.mjs --test test/*.test.mjs
-```
-
-- `test/host-pre-step.test.mjs`：宿主半边的摘块 / 追加 JSON 消息 / 按内容认领 / 合并 / 配置分支。
-- `test/client-half.test.mjs`：在 Node 里给 `client.js` 造最小 DOM + React + Cordis 环境，
-  跑通「批注 → JSON 负载 → 运行时草稿附件 → 挂进输入态 → 发送后被消费清空」整条数据通路、
-  锚点重建与字符区间捕获。
-- `test/loader.mjs` / `test/schemastery-shim.mjs`：把 `@deepseek-ai/schemastery`（只在宿主里可解析）
-  指到本地替身，让本地 `node --test` 也能跑。
-
-它验证的是**逻辑**；真实选区几何、高亮位置仍需在浏览器里看。
-
-## 排障
-
-浏览器控制台：
-
-```js
-window.__dshSelectionAnnotations.list()      // 当前批注集合
-window.__dshSelectionAnnotations.payload()   // 即将提交的 JSON 数据块（字符串）
-window.__dshSelectionAnnotations.drafts()    // 当前挂载的草稿附件 id（空数组 = 没挂上）
-window.__dshSelectionAnnotations.receipt()   // 同上，取第一个
-window.__dshSelectionAnnotations.session()   // 解析到的当前会话 id
-window.__dshSelectionAnnotations.add({...})  // 手工加一条（调试用）
-window.__dshSelectionAnnotations.update(id, note)  // 改一条（调试用）
-```
-
-## 已知限制（v1）
-
-- 批注的**原文与出处**不能改（只能改批注文字或删掉重加）。
-- 代码预览（`data-code-preview`）没有行号属性，行号按 `pre .line` 序号推算。
-- 锚点依赖语义 `data-*`；DSH 若更换这些属性名，需要同步更新 `client.js` 的锚点层。
-- 字符区间以锚点元素的 `textContent` 为口径，因此 DSH 若改变消息行的渲染范围，旧批注的区间会随之失效（此时回退到「引文 + 上下文」定位）。
+MIT

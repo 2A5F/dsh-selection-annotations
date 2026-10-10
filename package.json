@@ -1,9 +1,24 @@
 {
   "name": "dsh-selection-annotations",
   "version": "0.1.0",
-  "private": true,
+  "description": "DSH plugin: select text in the Web UI to annotate it, and send the whole set with your message as a separate JSON content block — never mixed into your message text.",
   "type": "module",
-  "description": "DSH 滑词批注：选中正文/文件/历史对话的原文建立批注，随消息以独立内容块发送，不混入消息正文。",
+  "license": "MIT",
+  "author": "U2A5F <U2A5F@outlook.com>",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "annotation",
+    "selection",
+    "quote",
+    "web"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
     "./client": "./client.js",
@@ -13,13 +28,15 @@
     "lib",
     "client.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md"
   ],
-  "engines": {
-    "node": ">=20"
-  },
   "scripts": {
     "test": "node --import ./test/loader.mjs --test test/*.test.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dsh": {
     "bundle": {
