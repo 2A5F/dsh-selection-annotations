@@ -1,6 +1,6 @@
 {
-  "name": "dsh-selection-annotations",
-  "version": "0.1.0",
+  "name": "@u2a5f/dsh-selection-annotations",
+  "version": "1.0.0",
   "description": "DSH plugin: select text in the Web UI to annotate it, and send the whole set with your message as a separate JSON content block — never mixed into your message text.",
   "type": "module",
   "license": "MIT",
@@ -34,6 +34,14 @@
   ],
   "scripts": {
     "test": "node --import ./test/loader.mjs --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2A5F/dsh-selection-annotations.git"
+  },
+  "homepage": "https://github.com/2A5F/dsh-selection-annotations#readme",
+  "bugs": {
+    "url": "https://github.com/2A5F/dsh-selection-annotations/issues"
   },
   "publishConfig": {
     "access": "public"

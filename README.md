@@ -95,7 +95,7 @@ Notes on the contract:
 ## Install
 
 ```sh
-dsh plugin --profile <profile> add dsh-selection-annotations
+dsh plugin --profile <profile> add @u2a5f/dsh-selection-annotations
 ```
 
 Or install the directory directly with DSH's plugin manager:
@@ -242,7 +242,7 @@ To reproduce the host's module resolution locally, run this from the profile dir
 
 ```sh
 cd "$DSH_PROFILE_DIR"
-node --input-type=module -e "import('dsh-selection-annotations').then(m => console.log('OK', Object.keys(m))).catch(e => console.error('FAIL', e.message))"
+node --input-type=module -e "import('@u2a5f/dsh-selection-annotations').then(m => console.log('OK', Object.keys(m))).catch(e => console.error('FAIL', e.message))"
 ```
 
 ## License

@@ -268,7 +268,7 @@ function loadBundle(env) {
     { SHOW_TEXT: 4 },
   )
   assert.equal(env.loaded.length, 1, 'bundle 必须注册恰好一个模块')
-  assert.equal(env.loaded[0].id, 'dsh-selection-annotations', 'bundle id 必须与包名逐字一致')
+  assert.equal(env.loaded[0].id, '@u2a5f/dsh-selection-annotations', 'bundle id 必须与包名逐字一致')
   return env.loaded[0].factory(env.require)
 }
 

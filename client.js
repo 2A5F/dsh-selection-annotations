@@ -1,5 +1,5 @@
 /**
- * dsh-selection-annotations — 客户端半边（Web bundle）。
+ * @u2a5f/dsh-selection-annotations — 客户端半边（Web bundle）。
  *
  * 设计要点（用户明确要求）：
  *   - 批注 **不写进消息正文**。既不拼草稿、也不做「发出去再从气泡里藏掉」的手术。
@@ -13,7 +13,7 @@
  * `data-textpreview-url` / `data-textpreview-line`），不依赖 CSS Modules 哈希类名。
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-selection-annotations',
+  id: '@u2a5f/dsh-selection-annotations',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -94,7 +94,7 @@ window.__ModuleLoader__.load({
 `
 
     return {
-      name: 'dsh-selection-annotations',
+      name: '@u2a5f/dsh-selection-annotations',
       inject: ['slots', 'sessions', 'conversation'],
       apply(ctx) {
         /* ------------------------------------------------------------------ 状态 */

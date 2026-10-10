@@ -87,7 +87,7 @@
 ## 安装
 
 ```sh
-dsh plugin --profile <profile> add dsh-selection-annotations
+dsh plugin --profile <profile> add @u2a5f/dsh-selection-annotations
 ```
 
 或者用 DSH 的插件管理器直接装目录：
@@ -218,7 +218,7 @@ npm test
 
 ```sh
 cd "$DSH_PROFILE_DIR"
-node --input-type=module -e "import('dsh-selection-annotations').then(m => console.log('OK', Object.keys(m))).catch(e => console.error('FAIL', e.message))"
+node --input-type=module -e "import('@u2a5f/dsh-selection-annotations').then(m => console.log('OK', Object.keys(m))).catch(e => console.error('FAIL', e.message))"
 ```
 
 ## 许可证
