@@ -1,0 +1,37 @@
+{
+  "name": "dsh-selection-annotations",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 滑词批注：选中正文/文件/历史对话的原文建立批注，随消息以独立内容块发送，不混入消息正文。",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --import ./test/loader.mjs --test test/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-session"
+      ]
+    }
+  }
+}
