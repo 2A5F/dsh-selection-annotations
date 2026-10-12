@@ -32,7 +32,7 @@ This plugin puts the annotations on the message as a real content block instead:
 | Select to annotate | Assistant replies, user messages, and workspace file previews. The note may be empty — that just marks the quote. |
 | Highlight + numbered badge | Light-yellow overlay plus a numbered badge, anchored on semantic `data-*` attributes. Re-located after scroll or re-render by character range + quote context. |
 | **Click the badge to edit** | Clicking a badge opens *that* annotation for editing (change the note, or delete it). The list panel has the same entry point. |
-| Precise positions | Every annotation records `charStart`/`charEnd` (a half-open range over the anchor element's `textContent`). File sources additionally record 1-based `lineStart`/`lineEnd` and the workspace-relative `path`. |
+| Precise positions | Every annotation records `charStart`/`charEnd` (half-open) plus the workspace-relative `path` and 1-based `lineStart`/`lineEnd` for file sources. Coordinates are resolved against the **original file** whenever it can be read — which is also where Markdown previews get their line numbers — and fall back to rendered-DOM coordinates otherwise; `source.textOrigin` says which. |
 | Trigger next to Send | Registered into `conversation.input.right`, so it occupies one compact control slot and never disturbs the composer layout. |
 | Floating panel | The "批注 ×N" panel is plain DOM appended to `body` with `position: fixed` — it is completely out of flow and never pushes the input box around. |
 | Sent as a separate block | The annotation set is packed into a `File` (`批注.json`) and handed to the runtime's own `createDrafts` + the input shell's `addFiles` — the exact path drag-and-drop attachments use. It is attached only once the upload reports `ready`. |
@@ -47,7 +47,7 @@ The model receives one extra message whose entire body is a self-describing JSON
 {
   "kind": "dsh-selection-annotations",
   "version": 1,
-  "instruction": "This is an annotation block the user attached to the previous message. It is separate from, and not part of, the user's message text. annotations[].quote is the text the user selected; annotations[].source gives its position ...",
+  "instruction": "This is an annotation block sent by the user. It is independent of the user's message text: they may have sent text alongside it, or only this block — in which case the block is the entire message. annotations[].quote is the text the user selected; annotations[].source gives its position ...",
   "count": 2,
   "annotations": [
     {
@@ -60,7 +60,8 @@ The model receives one extra message whose entire body is a self-describing JSON
         "lineStart": 4,
         "lineEnd": 4,
         "charStart": 126,
-        "charEnd": 130
+        "charEnd": 130,
+        "textOrigin": "source"
       }
     },
     {
@@ -73,7 +74,8 @@ The model receives one extra message whose entire body is a self-describing JSON
         "anchorKey": "14:assistant-step6:12",
         "flowKind": "assistant-step",
         "charStart": 40,
-        "charEnd": 46
+        "charEnd": 46,
+        "textOrigin": "rendered"
       }
     }
   ]
@@ -84,8 +86,12 @@ Notes on the contract:
 
 - **JSON, not prose.** Positions are things a program consumes — line numbers, character
   ranges, anchor keys. Structured fields do not get lost in natural language.
-- `charStart`/`charEnd` is a **half-open range** `[charStart, charEnd)` measured over the anchor
-  element's `textContent`. A quote can repeat; a character range cannot.
+- `charStart`/`charEnd` is a **half-open range** `[charStart, charEnd)`. Which text it indexes is
+  declared by `source.textOrigin`: `"source"` means offsets into the **file's own text**, so they
+  can be applied to the file directly; `"rendered"` means offsets into the rendered DOM text of
+  the anchor element. A hit in the file requires the plugin to read it and find the quote there,
+  so it falls back to `"rendered"` when the file is unreadable or the quote straddles inline
+  Markdown markup. A quote can repeat; a character range cannot.
 - `lineStart`/`lineEnd` are **1-based** and only present for workspace file sources.
 - The host claims the payload **by content**: the parsed JSON must carry
   `kind: "dsh-selection-annotations"`. The file name is only a cheap pre-filter, so renaming the
@@ -152,7 +158,30 @@ the host half turns it into its own message.
    "one or more files have not finished uploading". Wait for `fileUploads[id].status === 'ready'`.
 3. **Releasing your own attachment must be masked from the consumption watcher**, otherwise the
    removal is mistaken for "the message was sent" and the annotation set is cleared.
-4. **A `link:`-installed plugin cannot statically import `@deepseek-ai/*`.** Module resolution
+4. **Do not decide "the attachment was consumed" from a notification — and do not use the
+   runtime's private draft table either.** The submit path removes the attachment ids from the
+   input state and only retires them later; for an attachment-only send (no text) the runtime
+   keeps its draft entry alive until admission settles, so `resolveDraftAttachments` keeps
+   returning it and that check never fires. Conversely, when the outcome is not a success the
+   composer calls `restoreAttachments` and the ids come back. The rule that works: read the
+   input shell's **live** `attachmentIds` field (not the published snapshot — it lags whenever
+   nothing publishes), confirm after a short delay that it still does not hold your ids, and
+   only then clear. That restore can also land long after the turn looks finished, so keep a
+   short guard afterwards: if the ids come back, remove them — the annotations were already
+   delivered, and a chip with nothing behind it just misleads.
+5. **Rendered-DOM offsets are not source offsets.** For a multi-line selection they differ by the
+   newline characters alone, and Markdown rendering drops `#`, `**`, and link URLs entirely. If a
+   consumer will use the offsets against the file, resolve them against the file text
+   (`ctx.remote.workspaceFiles.read`) rather than the DOM — that is what `textOrigin: "source"` marks.
+   Reaching that API needs `'remote'` in the client module's `inject` list: the restricted client
+   context only exposes declared services, so without it `ctx.remote` is simply absent and the
+   lookup falls back to rendered coordinates without any error.
+6. **The client sandbox has `console.log` and `console.error` — and no `console.warn`.**
+   Calling a method that is not there throws, and a throw inside a `catch` turns a handled
+   failure into an unhandled rejection that silently skips whatever came after it. Wrap every
+   log call so it can never break a flow, and never let logging be the only trace of a failure
+   path: on a surface without a console, the trace has to travel with the data.
+7. **A `link:`-installed plugin cannot statically import `@deepseek-ai/*`.** Module resolution
    follows the plugin's real path (your source checkout), which has no `node_modules`, so those
    specifiers fail to resolve; a static import makes the whole host half fail to load
    (`fiberPhase` stays `null`) and the feature silently disappears from the UI. This plugin
@@ -197,9 +226,9 @@ Warnings from the plugin are prefixed `[selection-annotations]`.
 
 - The **quote and source of an annotation cannot be edited** — only the note text, or delete and
   re-annotate.
-- **Markdown previews have no line numbers.** Code previews fall back to the `.line` index and
-  plain-text previews use `data-textpreview-line`, but a rendered Markdown document has neither,
-  so those annotations carry a character range only.
+- **A quote that straddles inline Markdown markup may lack line numbers.** Markdown line numbers
+  come from reading the original file and locating the quote in it; if the quote crosses `**bold**`,
+  a link, or a code span, the lookup misses and the annotation keeps rendered-DOM coordinates.
 - Anchoring depends on semantic `data-*` attributes (`data-chat-anchor-key`,
   `data-chat-flow-kind`, `data-textpreview-url`, `data-code-preview`). If DSH renames them, the
   anchor layer in `client.js` needs updating.
@@ -208,6 +237,8 @@ Warnings from the plugin are prefixed `[selection-annotations]`.
   quote + surrounding context.
 - Conversation messages carry character ranges but no line numbers: after Markdown rendering, a
   visual line number is not a stable coordinate.
+- The `instruction` inside the payload and the plugin's own UI strings are currently hard-coded
+  Chinese; they are not routed through the DSH locale service yet.
 
 ## Development
 
@@ -233,6 +264,12 @@ Reload behaviour while developing:
 | Client `client.js` | Hot-swapped by `@deepseek-ai/dsh-client-hmr` (~500ms poll). **Refresh the page.** |
 | Host `lib/index.js`, already loaded once | **Does not hot-reload.** Neither disable→enable nor `remove_bundle` + `install_bundle` helps (Node ESM module cache). **Restart the host process.** |
 | Host `lib/index.js`, previously failed to load (`fiberPhase: null`) | A single disable→enable re-imports it — **takes effect immediately** |
+
+Do **not** use `remove_bundle` to force a reload of a `link:`-installed plugin: it has been
+observed to remove the profile's dependency and `bundles` entries — leaving the plugin
+uninstalled, with both halves unregistered — while still reporting `application: failed` /
+`not-removable`. Recover with `install_bundle` pointed at the directory. Re-running
+`install_bundle` is enough to re-materialize the client half.
 
 To tell whether the plugin is actually running, check `fiberPhase` for its entry in
 `plugin_manager list_plugins`: `active` means running, `null` means the module failed to load

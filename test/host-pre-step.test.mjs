@@ -142,6 +142,16 @@ test('非 user 来源的消息不被处理（防止处理我们自己追加的�
   assert.equal(decision.messages[0], message)
 })
 
+test('同一份批注块被挂了两遍时只算一份（附件被 restore 回去又挂一次）', async () => {
+  const decision = await run(
+    [userMessage([{ type: 'text', text: 'q' }, fileBlock('a1'), fileBlock('a2')])],
+    { a1: REPORT, a2: REPORT },
+  )
+  assert.equal(decision.messages.length, 2, '正文一条 + 批注一条，不该多出第二条批注')
+  const forwarded = JSON.parse(decision.messages[1].content[0].text)
+  assert.equal(forwarded.count, 1, '两份一模一样的内容只保留一份')
+})
+
 test('多个批注附件会被合并成一份数据块，index 重新连续', async () => {
   const second = JSON.stringify({ ...PAYLOAD, count: 1, annotations: [{ ...PAYLOAD.annotations[0], index: 1, quote: '第二处' }] })
   const decision = await run(

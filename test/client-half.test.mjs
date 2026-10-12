@@ -11,6 +11,14 @@ import { readFileSync } from 'node:fs'
 
 const SOURCE = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 
+/** 测试用的「源文件」：第 3 行有引文，且引文外面包着 Markdown 强调标记。 */
+const SOURCE_TEXT = [
+  '# 标题',
+  '',
+  '聊天界面里做「选中 → 批注」最直觉的**做法是：提交**时把批注块拼进草稿。',
+  '',
+].join('\n')
+
 /* ------------------------------------------------------------------ 最小 DOM */
 
 const node = (text) => ({ nodeType: 3, nodeValue: text, parentElement: null, isConnected: true })
@@ -139,6 +147,9 @@ function positionOf(root, target, offset) {
   return -1
 }
 
+/** 轮询定时器不能撑住测试进程：unref 后仍会触发，但不阻止 node --test 退出。 */
+const nodeSetInterval = setInterval
+
 function makeEnvironment() {
   let rangeRoot = null
 
@@ -208,6 +219,12 @@ function makeEnvironment() {
     __ModuleLoader__: { load: (mod) => loaded.push(mod) },
     setTimeout,
     clearTimeout,
+    setInterval: (...args) => {
+      const timer = nodeSetInterval(...args)
+      if (typeof timer?.unref === 'function') timer.unref()
+      return timer
+    },
+    clearInterval,
     addEventListener() {},
     removeEventListener() {},
     innerWidth: 1200,
@@ -300,19 +317,29 @@ function makeHarness(options = {}) {
   const mod = loadBundle(env)
 
   const uploads = []
+  const sourceReads = []
   const released = []
   const registrations = []
   const draftAttachments = new Map()
   let draftSeq = 0
 
   const fileUploads = createStore({})
+  // 运行时外壳的「实时字段」：插件据此判断附件是否还在。
+  let liveIds = []
+  // 「已发布快照」：只有 publish() 之后才与实时字段一致（真实运行时也会滞后）。
   let inputSnapshot = { draft: '', attachmentIds: [] }
   const inputSubscribers = new Set()
   const publish = () => {
     for (const fn of [...inputSubscribers]) fn()
   }
+  const syncSnapshot = () => {
+    inputSnapshot = { ...inputSnapshot, attachmentIds: liveIds }
+  }
 
   const shell = {
+    get attachmentIds() {
+      return liveIds
+    },
     state: {
       getSnapshot: () => inputSnapshot,
       subscribe(fn) {
@@ -321,12 +348,16 @@ function makeHarness(options = {}) {
       },
     },
     addFiles(references, ids) {
-      inputSnapshot = { ...inputSnapshot, attachmentIds: [...inputSnapshot.attachmentIds, ...ids] }
+      liveIds = [...liveIds, ...ids]
+      syncSnapshot()
       publish()
       return true
     },
     removeAttachment(id) {
-      inputSnapshot = { ...inputSnapshot, attachmentIds: inputSnapshot.attachmentIds.filter((x) => x !== id) }
+      const next = liveIds.filter((x) => x !== id)
+      if (next.length === liveIds.length) return false
+      liveIds = next
+      syncSnapshot()
       publish()
       return true
     },
@@ -355,6 +386,10 @@ function makeHarness(options = {}) {
         return { kind: 'file', id }
       })
     },
+    /** 运行时真正持有的草稿表 —— 拉取式消费检测读的就是它。 */
+    resolveDraftAttachments(ids) {
+      return ids.filter((id) => draftAttachments.has(id)).map((id) => draftAttachments.get(id))
+    },
     releaseDraftAttachment(id) {
       released.push(id)
       draftAttachments.delete(id)
@@ -366,9 +401,57 @@ function makeHarness(options = {}) {
 
   if (options.noRuntime === true) delete conversation.createDrafts
 
-  /** 模拟消息发出：草稿与附件一起被 composer 清掉。 */
+  const releaseAllDrafts = () => {
+    for (const id of [...draftAttachments.keys()]) conversation.releaseDraftAttachment(id)
+  }
+
+  /** 正常发送：输入态交出附件，运行时也退休它们。 */
   const send = () => {
-    inputSnapshot = { draft: '', attachmentIds: [] }
+    liveIds = []
+    syncSnapshot()
+    publish()
+    releaseAllDrafts()
+  }
+
+  /**
+   * 只发附件（无正文）：输入态交出附件，但运行时的草稿表**仍持有**条目
+   * 直到 admission 结算 —— 这是实测到的真实行为。
+   */
+  const sendAttachmentOnly = () => {
+    liveIds = []
+    syncSnapshot()
+    publish()
+  }
+
+  /** 实时字段变了，但一次通知都没发布（已发布快照滞后）。 */
+  const sendWithoutPublish = () => {
+    liveIds = []
+  }
+
+  /** 模拟「上一轮遗留」：输入态里挂着一个插件不认识的 批注.json。 */
+  const plantOrphan = (id, name = '批注.json') => {
+    draftAttachments.set(id, { kind: 'file', id, file: { name } })
+    liveIds = [...liveIds, id]
+    syncSnapshot()
+    publish()
+  }
+
+  /** 模拟运行时的 settleDetachedFailure：把已发出的附件 restore 回输入态。 */
+  const restoreStray = () => {
+    liveIds = [...draftAttachments.keys(), ...liveIds]
+    syncSnapshot()
+    publish()
+  }
+
+  /** 模拟提交先移走附件、随后失败 restore 回来（运行时并未释放它们）。 */
+  const sendThenRestore = async (delayMs = 100) => {
+    const ids = [...liveIds]
+    liveIds = []
+    syncSnapshot()
+    publish()
+    await new Promise((resolve) => setTimeout(resolve, delayMs))
+    liveIds = ids
+    syncSnapshot()
     publish()
   }
 
@@ -376,6 +459,19 @@ function makeHarness(options = {}) {
     get(name) {
       if (name === 'uiSession' && options.noSession !== true) {
         return { adapter: { current: { getSnapshot: () => ({ key: options.sessionId ?? 's1' }) } } }
+      }
+      if (name === 'remote') {
+        if (options.remoteThrows === true) throw new Error('remote 不可用')
+        return {
+          workspaceFiles: {
+            async read(sessionId, path, range) {
+              sourceReads.push({ sessionId, path, range })
+              if (options.sourceUnavailable === true) throw new Error('读不到源文件')
+              const text = options.sourceText ?? SOURCE_TEXT
+              return { offset: 0, text, lines: text.split('\n').length, eof: true, absolutePath: path, version: 'v1' }
+            },
+          },
+        }
       }
       return undefined
     },
@@ -410,6 +506,7 @@ function makeHarness(options = {}) {
     mod,
     ctx,
     uploads,
+    sourceReads,
     released,
     registrations,
     shell,
@@ -417,6 +514,11 @@ function makeHarness(options = {}) {
     fileUploads,
     inputState: () => inputSnapshot,
     send,
+    sendAttachmentOnly,
+    sendWithoutPublish,
+    restoreStray,
+    plantOrphan,
+    sendThenRestore,
     debug: env.window.__dshSelectionAnnotations,
   }
 }
@@ -434,6 +536,7 @@ test('apply 之后：悬挂 UI 建成、批注按钮注册进发送按钮旁的�
   assert.equal(harness.registrations[0].opts.name, 'conversation.input.right', '必须在发送按钮旁的紧凑控件槽位')
   assert.equal(harness.registrations[0].opts.id, 'selection-annotations')
   assert.equal(typeof harness.registrations[0].Component, 'function')
+  assert.ok(harness.mod.inject.includes('remote'), '声明 remote 才能拿到 ctx.remote 读工作区原文')
   assert.equal(harness.env.document.body.childNodes.length, 4, '覆盖层 / 工具条 / 批注弹层 / 悬浮面板都要挂上')
 
   const ui = harness.env.document.head.childNodes[0]
@@ -480,22 +583,24 @@ test('批注负载是自描述的 JSON 数据块，位置用行号 + 字符区�
     flowKind: 'assistant-step',
     charStart: 40,
     charEnd: 52,
+    textOrigin: 'rendered',
   })
 
   assert.equal(second.index, 2)
-  assert.deepEqual(second.source, { kind: 'file', path: 'src/a.ts', lineStart: 12, lineEnd: 18, charStart: 100, charEnd: 110 })
+  assert.deepEqual(second.source, { kind: 'file', path: 'src/a.ts', lineStart: 12, lineEnd: 18, charStart: 100, charEnd: 110, textOrigin: 'rendered' })
 })
 
 test('位置字段缺省时不会往 JSON 里塞 null 噪声', () => {
   const harness = makeHarness()
   const { payloadSource } = harness.debug._internals
-  assert.deepEqual(payloadSource({ kind: 'file', path: 'a.ts' }), { kind: 'file', path: 'a.ts' })
+  assert.deepEqual(payloadSource({ kind: 'file', path: 'a.ts' }), { kind: 'file', path: 'a.ts', textOrigin: 'rendered' })
   assert.deepEqual(payloadSource({ kind: 'message', flowKind: 'user', charStart: 0, charEnd: 3 }), {
     kind: 'message',
     role: 'user',
     flowKind: 'user',
     charStart: 0,
     charEnd: 3,
+    textOrigin: 'rendered',
   })
   assert.deepEqual(payloadSource(undefined), { kind: 'dom' })
 })
@@ -550,9 +655,49 @@ test('消息发出（附件被消费）后自动清空，不会黏到下一条�
   assert.equal(harness.debug.list().length, 1)
 
   harness.send()
-  await wait(30)
+  await wait(700)
   assert.equal(harness.debug.list().length, 0, '附件被消费后批注应视为已送达')
   assert.deepEqual(harness.debug.drafts(), [])
+})
+
+test('提交失败把附件 restore 回来时不得清空批注（否则批注与附件状态会对不上）', async () => {
+  const harness = makeHarness()
+  harness.debug.add({ quote: 'q', note: 'n', source: { kind: 'message', anchorKey: 'k1' } })
+  await settle()
+  assert.equal(harness.debug.list().length, 1)
+
+  await harness.sendThenRestore(100)
+  await wait(700)
+
+  assert.equal(harness.debug.list().length, 1, '附件还在，批注就不该被清掉')
+  assert.equal(harness.debug.drafts().length, 1, '附件仍在草稿里')
+})
+
+test('插件重载后，输入框里遗留的孤儿批注附件会被认领摘掉', async () => {
+  const harness = makeHarness()
+  // 上一轮把 `批注.json` 留在了输入态，而这次插件是全新加载的（内存守卫为空）。
+  harness.plantOrphan('d-orphan')
+  assert.deepEqual(harness.inputState().attachmentIds, ['d-orphan'])
+
+  await wait(2000)
+
+  assert.deepEqual(harness.inputState().attachmentIds, [], '孤儿附件必须被摘掉')
+})
+
+test('发出后被运行时 restore 回来的孤儿附件会被摘掉，不在输入框里赖着', async () => {
+  const harness = makeHarness()
+  harness.debug.add({ quote: 'q', note: 'n', source: { kind: 'message', anchorKey: 'k1' } })
+  await settle()
+
+  harness.sendAttachmentOnly()
+  await wait(700)
+  assert.equal(harness.debug.list().length, 0, '批注先清空')
+
+  // 回合结束之后，运行时才把它 restore 回来（settleDetachedFailure）。
+  harness.restoreStray()
+  await wait(300)
+
+  assert.deepEqual(harness.inputState().attachmentIds, [], '孤儿附件必须被摘掉')
 })
 
 test('还没确认挂上之前，输入态抖动不会误清批注', async () => {
@@ -564,6 +709,32 @@ test('还没确认挂上之前，输入态抖动不会误清批注', async () =>
 
   assert.equal(harness.debug.list().length, 1, '批注必须还在')
   assert.equal(harness.debug.drafts().length, 1, '随后仍应正常挂上')
+})
+
+test('只发附件（无正文）时也要清空：输入态交出附件，运行时仍持有草稿', async () => {
+  const harness = makeHarness()
+  harness.debug.add({ quote: 'q', note: 'n', source: { kind: 'message', anchorKey: 'k1' } })
+  await settle()
+  assert.equal(harness.debug.list().length, 1)
+
+  harness.sendAttachmentOnly()
+  await wait(700)
+
+  assert.equal(harness.debug.list().length, 0, '只发附件也必须清空')
+  assert.deepEqual(harness.debug.drafts(), [])
+})
+
+test('输入态快照没发布时，轮询实时字段仍能清空', async () => {
+  const harness = makeHarness()
+  harness.debug.add({ quote: 'q', note: 'n', source: { kind: 'message', anchorKey: 'k1' } })
+  await settle()
+
+  // 实时字段变了，但一次通知都没发布 —— 只有轮询实时字段才抓得到。
+  harness.sendWithoutPublish()
+  assert.equal(harness.debug.list().length, 1)
+
+  await wait(1800)
+  assert.equal(harness.debug.list().length, 0, '轮询实时字段应当兜住')
 })
 
 test('追加减批注只保留一个附件：旧的会被摘掉', async () => {
@@ -706,6 +877,100 @@ test('出处捕获：代码预览没有行号属性，按 .line 序号推算行�
   assert.equal(source.lineEnd, 3)
   assert.equal(source.charStart, 'line one'.length + 'line two'.length + 5)
   assert.equal(source.charEnd, 'line one'.length + 'line two'.length + 8)
+})
+
+test('源文件定位：空白折叠后仍能命中，并把区间折算回原文坐标', () => {
+  const harness = makeHarness()
+  const { locateInSource, lineOfOffset } = harness.debug._internals
+
+  const hit = locateInSource(SOURCE_TEXT, '做法是：提交')
+  assert.ok(hit !== undefined, '应当能在源文里找到引文')
+  assert.equal(SOURCE_TEXT.slice(hit.start, hit.end), '做法是：提交', '区间必须落在原文上（标记在引文之外）')
+  assert.equal(lineOfOffset(SOURCE_TEXT, hit.start), 3, '引文在第 3 行')
+  assert.equal(lineOfOffset(SOURCE_TEXT, hit.end - 1), 3)
+
+  // 引文里的换行/多余空白会被折叠掉
+  assert.ok(locateInSource('alpha   beta\ngamma', 'alpha beta gamma') !== undefined)
+  assert.equal(locateInSource(SOURCE_TEXT, '完全不在原文里的句子'), undefined)
+  assert.equal(locateInSource(SOURCE_TEXT, '   '), undefined)
+})
+
+test('定位到源文件时给出行号与原文坐标，拿不到就退回渲染坐标', async () => {
+  const harness = makeHarness()
+  const { resolveSourcePosition } = harness.debug._internals
+
+  const precise = await resolveSourcePosition({ kind: 'file', path: 'a.md' }, '做法是：提交')
+  assert.equal(precise.textOrigin, 'source')
+  assert.equal(precise.lineStart, 3)
+  assert.equal(precise.lineEnd, 3)
+  assert.equal(SOURCE_TEXT.slice(precise.charStart, precise.charEnd), '做法是：提交')
+  assert.equal(harness.sourceReads.length, 1, '应当读了一次源文件')
+
+  assert.equal(await resolveSourcePosition({ kind: 'message' }, 'x'), undefined, '只有文件来源才查原文')
+  assert.equal(await resolveSourcePosition({ kind: 'file' }, 'x'), undefined, '没有路径就不查')
+  assert.equal(await resolveSourcePosition({ kind: 'file', path: 'a.md' }, '不在原文里'), undefined)
+})
+
+test('remote 拿不到时，位置精修安静失败而不是把异常抛给创建流程', async () => {
+  const harness = makeHarness({ remoteThrows: true })
+  const { resolveSourcePosition } = harness.debug._internals
+  assert.equal(await resolveSourcePosition({ kind: 'file', path: 'a.md' }, '做法是：提交'), undefined)
+})
+
+test('位置精修只补位置：原文与批注文字不变，负载随之更新', async () => {
+  const harness = makeHarness()
+  const created = harness.debug.add({
+    quote: '做法是：提交',
+    note: '原批注',
+    source: { kind: 'file', path: 'README.zh-CN.md', charStart: 1, charEnd: 7, textOrigin: 'rendered' },
+  })
+  await settle()
+  const before = await payloadOf(harness.uploads[0])
+  assert.equal(before.annotations[0].source.textOrigin, 'rendered', '创建瞬间还是渲染坐标')
+
+  await harness.debug._internals.refineSourcePosition(created.id, created.source, created.quote)
+  await settle()
+
+  const item = harness.debug.list()[0]
+  assert.equal(item.quote, '做法是：提交', '原文不变')
+  assert.equal(item.note, '原批注', '批注文字不变')
+  assert.equal(item.source.textOrigin, 'source')
+  assert.equal(item.source.lineStart, 3)
+
+  const after = await payloadOf(harness.uploads[harness.uploads.length - 1])
+  assert.equal(after.annotations[0].source.textOrigin, 'source', '精修后的负载要跟着更新')
+  assert.equal(after.annotations[0].source.lineStart, 3)
+})
+
+test('诊断随载荷一起发出：构建标记与精修结果都能看到', async () => {
+  const harness = makeHarness({ remoteThrows: true })
+  const created = harness.debug.add({ quote: 'q', note: 'n', source: { kind: 'file', path: 'a.md' } })
+  await settle()
+
+  await harness.debug._internals.refineSourcePosition(created.id, created.source, created.quote)
+  await settle()
+
+  const payload = await payloadOf(harness.uploads[harness.uploads.length - 1])
+  assert.equal(typeof payload.diagnostics.build, 'string', '构建标记要随载荷发出，好判断跑的是哪一版')
+  assert.ok(
+    payload.diagnostics.refine.some((line) => line.includes('remote')),
+    '精修失败的原因要随载荷发出来',
+  )
+})
+
+test('读不到源文件时安静退回渲染坐标', async () => {
+  const harness = makeHarness({ sourceUnavailable: true })
+  const { resolveSourcePosition } = harness.debug._internals
+  assert.equal(await resolveSourcePosition({ kind: 'file', path: 'a.md' }, '做法是：提交'), undefined)
+})
+
+test('负载里带上坐标口径：能读到原文用 source，否则 rendered', () => {
+  const harness = makeHarness()
+  const { payloadSource } = harness.debug._internals
+  assert.equal(payloadSource({ kind: 'file', path: 'a.md', textOrigin: 'source' }).textOrigin, 'source')
+  assert.equal(payloadSource({ kind: 'file', path: 'a.md' }).textOrigin, 'rendered')
+  assert.equal(payloadSource({ kind: 'message', role: 'assistant' }).textOrigin, 'rendered')
+  assert.equal(payloadSource({ kind: 'dom' }).textOrigin, undefined, '非文件/消息来源不带口径')
 })
 
 test('出处捕获：助手消息锚点 + 文件路径与行号', () => {
