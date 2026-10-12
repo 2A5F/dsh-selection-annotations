@@ -942,22 +942,6 @@ test('位置精修只补位置：原文与批注文字不变，负载随之更�
   assert.equal(after.annotations[0].source.lineStart, 3)
 })
 
-test('诊断随载荷一起发出：构建标记与精修结果都能看到', async () => {
-  const harness = makeHarness({ remoteThrows: true })
-  const created = harness.debug.add({ quote: 'q', note: 'n', source: { kind: 'file', path: 'a.md' } })
-  await settle()
-
-  await harness.debug._internals.refineSourcePosition(created.id, created.source, created.quote)
-  await settle()
-
-  const payload = await payloadOf(harness.uploads[harness.uploads.length - 1])
-  assert.equal(typeof payload.diagnostics.build, 'string', '构建标记要随载荷发出，好判断跑的是哪一版')
-  assert.ok(
-    payload.diagnostics.refine.some((line) => line.includes('remote')),
-    '精修失败的原因要随载荷发出来',
-  )
-})
-
 test('读不到源文件时安静退回渲染坐标', async () => {
   const harness = makeHarness({ sourceUnavailable: true })
   const { resolveSourcePosition } = harness.debug._internals

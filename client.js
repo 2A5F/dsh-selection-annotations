@@ -36,11 +36,6 @@ window.__ModuleLoader__.load({
     const CONSUME_POLL_MS = 1000
     /** 输入态说「附件没了」之后，隔多久向运行时求证（提交可能只是暂时移走）。 */
     const CONSUME_CONFIRM_MS = 400
-    /**
-     * 构建标记：DSH Desktop 没有 DevTools 控制台，没法用日志确认「客户端跑的是哪一版」，
-     * 所以把标记显示在面板页脚 —— 改动这个字符串就相当于一个版本探针。
-     */
-    const BUILD_TAG = '诊断#9'
     /** 读源文件求行号的超时；超时就退回渲染坐标，不拖住保存。 */
     const SOURCE_LOOKUP_TIMEOUT_MS = 600
     /** 认领「上一轮遗留的孤儿批注附件」的间隔。 */
@@ -165,20 +160,6 @@ window.__ModuleLoader__.load({
         /** 定期认领孤儿附件的计时器。 */
         let orphanTimer = null
         /** 只打一次「经哪条路读到原文」，避免刷屏。 */
-        let refineLogged = false
-        /**
-         * 诊断流水（临时手段）：DSH Desktop 没有 DevTools 控制台，日志无处可看，
-         * 所以把位置精修的逐环节结果攒起来，随批注载荷一起发给模型 —— 用户只需照常发送。
-         */
-        const DIAGNOSTICS = []
-
-        /** 记一行诊断；重复的相邻行不重复记。 */
-        function noteDiag(line) {
-          const text = String(line)
-          if (DIAGNOSTICS[DIAGNOSTICS.length - 1] === text) return
-          DIAGNOSTICS.push(text)
-          if (DIAGNOSTICS.length > 24) DIAGNOSTICS.shift()
-        }
         /** 已随消息发出、但运行时可能稍后 restore 回来的草稿附件 id → 守卫截止时间。 */
         const strayIds = new Map()
 
@@ -565,21 +546,19 @@ window.__ModuleLoader__.load({
           try {
             return await resolveSourcePositionInner(source, quote, onSkip)
           } catch (error) {
-            // 抛错绝不能无声消失：桌面端没有控制台，唯一能看见它的地方就是这份诊断。
-            noteDiag(`${String(source?.path)} → 抛错：${error instanceof Error ? error.message : String(error)}`)
+            // 抛错绝不能无声消失：安静退回渲染坐标，控制台留一行原因。
+            log(`[selection-annotations] 位置精修抛错：${error instanceof Error ? error.message : String(error)}`)
             return undefined
           }
         }
 
         async function resolveSourcePositionInner(source, quote, onSkip) {
           /**
-           * 精修失败一律安静退回，但要留下「断在哪一环」的证据。默认打到控制台；
-           * 传了 onSkip 就交出去 —— 插件把它显示在面板里，用户不必开 F12。
-           * @param reason - 断点描述。
+           * 精修失败一律安静退回（退到渲染坐标，绝不阻断创建），但原因要有去处：
+           * 控制台一行日志，另外交给 onSkip —— 插件把它显示在面板条目上。
            */
           const skip = (reason) => {
             log(`[selection-annotations] 位置精修跳过（${String(source?.path)}）：${reason}`)
-            noteDiag(`${String(source?.path)} → ${reason}`)
             if (typeof onSkip === 'function') onSkip(reason)
             return undefined
           }
@@ -587,42 +566,35 @@ window.__ModuleLoader__.load({
           if (typeof source.path !== 'string' || source.path === '') return undefined
           const sessionId = currentSessionId()
           if (sessionId === undefined) return skip('拿不到当前会话 id')
-          // 走客户端 remote 读原文；命名空间已在 inject 里声明，所以这里应当取得。
-          // 客户端上下文的 remote 不止一种作用域：会话作用域要走 sessions.scope(id).remote，
-          // 根上下文也可能直接带 remote。依次试，哪条能用用哪条。
+          // 读原文要经 remote：客户端上下文只把 inject 里声明过的命名空间挂上去，
+          // 所以 `remote.workspaceFiles` 必须先写进 inject（少写就取值即抛）。
+          // 而 remote 本身有两种作用域 —— 会话作用域（sessions.scope().remote）与根上下文
+          // （ctx.remote）—— 前者不带这个命名空间，因此逐个探测、哪个能用用哪个。
           const candidates = []
           const agent = safe(() => ctx.sessions?.scope?.(sessionId))
           if (agent?.remote !== undefined) candidates.push({ label: 'sessions.scope().remote', remote: agent.remote })
           const direct = safe(() => ctx.remote) ?? safe(() => ctx.get('remote'))
           if (direct !== undefined) candidates.push({ label: 'ctx.remote', remote: direct })
-          noteDiag(`候选 remote：${candidates.map((entry) => entry.label).join(' / ') || '一个都没有'}`)
-          // 取命名空间可能抛错（typert facade 的属性访问会走代理），所以每个候选单独试并留证。
+          // 探测放在 safe 里：取不到的候选会抛，而不是返回 undefined。
           let usable
           for (const entry of candidates) {
             const probe = safe(() => typeof entry.remote?.workspaceFiles?.read === 'function')
             if (probe === undefined) {
-              noteDiag(`探测 ${entry.label}.workspaceFiles 抛错`)
               continue
             }
             if (probe === true) {
               usable = entry
               break
             }
-            noteDiag(`探测 ${entry.label}.workspaceFiles：没有 read`)
           }
           if (usable === undefined) {
             return skip(`拿不到 remote.workspaceFiles.read（试过 ${candidates.map((e) => e.label).join(' / ') || '无任何 remote'}）`)
           }
-          if (refineLogged === false) {
-            refineLogged = true
-            log(`[selection-annotations] 位置精修：经 ${usable.label} 读原文`)
-          }
-          noteDiag(`开始读取 ${source.path}`)
+          log(`[selection-annotations] 位置精修：经 ${usable.label} 读 ${source.path}`)
           const outcome = await withTimeout(
             safe(() => usable.remote.workspaceFiles.read(sessionId, source.path, {})),
             SOURCE_LOOKUP_TIMEOUT_MS,
           )
-          noteDiag(`读取已返回：ok=${String(outcome.ok)}`)
           if (outcome.ok === false) return skip(`读取失败：${outcome.reason}`)
           const file = unwrapRemote(outcome.value)
           const text = typeof file?.text === 'string' ? file.text : undefined
@@ -635,7 +607,6 @@ window.__ModuleLoader__.load({
                 : '引文不在原文里（多半是跨了行内 Markdown 标记）',
             )
           }
-          noteDiag(`${source.path} → 读到原文（${text.length} 字符，经 ${usable.label}，行 ${lineOfOffset(text, hit.start)}）`)
           return {
             charStart: hit.start,
             charEnd: hit.end,
@@ -914,8 +885,6 @@ window.__ModuleLoader__.load({
                 note: item.note,
                 source: payloadSource(item.source),
               })),
-              // 临时：诊断随载荷一起发出去。桌面端没有控制台，这是唯一能拿到现场信息的通道。
-              diagnostics: { build: BUILD_TAG, refine: DIAGNOSTICS.slice(-12) },
             },
             null,
             2,
@@ -1355,8 +1324,7 @@ window.__ModuleLoader__.load({
           })
           if (!hit) return
           emit()
-          // 诊断也随载荷走：上传正在等我们时它会带上，否则补排一次。
-          if (!syncing) scheduleSync()
+          // 原因只显示在面板里、不进载荷，所以不需要为此重传附件。
           scheduleRepaint()
         }
 
@@ -1540,7 +1508,7 @@ window.__ModuleLoader__.load({
 
           const foot = el('div', 'sa-foot')
           if (annotations.length > 0) foot.appendChild(button('sa-link', '清空', () => clearAnnotations()))
-          foot.appendChild(el('span', 'sa-hint', `发送时批注作为独立块随消息提交 · ${BUILD_TAG}`))
+          foot.appendChild(el('span', 'sa-hint', '发送时批注作为独立块随消息提交'))
           panelEl.appendChild(foot)
         }
 
