@@ -336,9 +336,15 @@ function makeHarness(options = {}) {
     inputSnapshot = { ...inputSnapshot, attachmentIds: liveIds }
   }
 
+  // 输入框里的引用投影（真实运行时由 Lexical 文档算出来；这里只要 text 序列就够）。
+  let quoteTexts = Array.isArray(options.quotes) ? [...options.quotes] : []
+
   const shell = {
     get attachmentIds() {
       return liveIds
+    },
+    get projection() {
+      return { quotes: quoteTexts.map((text) => ({ text })) }
     },
     state: {
       getSnapshot: () => inputSnapshot,
@@ -519,6 +525,11 @@ function makeHarness(options = {}) {
     restoreStray,
     plantOrphan,
     sendThenRestore,
+    setQuotes(texts) {
+      quoteTexts = [...texts]
+      syncSnapshot()
+      publish()
+    },
     debug: env.window.__dshSelectionAnnotations,
   }
 }
@@ -603,6 +614,22 @@ test('位置字段缺省时不会往 JSON 里塞 null 噪声', () => {
     textOrigin: 'rendered',
   })
   assert.deepEqual(payloadSource(undefined), { kind: 'dom' })
+})
+
+test('负载按引用计数：4 条引用 3 个批注，index 就是界面编号', () => {
+  const quotes = ['甲段原文', '乙段原文', '丙段原文', '丁段原文']
+  const harness = makeHarness({ quotes })
+  for (const text of ['甲段原文', '乙段原文', '丁段原文']) {
+    harness.debug.add({ quote: text, note: '测试', source: { kind: 'quote', text, from: 'message', anchorKey: 'k1' } })
+  }
+
+  const payload = JSON.parse(harness.debug.payload())
+  assert.equal(payload.count, 4, '负载条数必须与输入框里的引用条数一致')
+  assert.equal(payload.described, 3, '有描述的条数单独给出')
+  assert.deepEqual(payload.annotations.map((item) => item.index), [1, 2, 3, 4], 'index 是用户在角标上看到的编号')
+  assert.deepEqual(payload.annotations.map((item) => item.note), ['测试', '测试', '', '测试'], '只引用没描述的条目 note 为空')
+  assert.equal(payload.annotations[2].quote, '丙段原文', '没有批注的那条也要留在负载里，编号才不会错位')
+  assert.equal(payload.annotations[3].source.kind, 'quote')
 })
 
 test('批注集合 → 运行时草稿附件 → 挂进输入态（官方 createDrafts/addFiles 链路）', async () => {
@@ -985,4 +1012,145 @@ test('出处捕获：助手消息锚点 + 文件路径与行号', () => {
   assert.equal(fileSource.lineStart, 12)
   assert.equal(fileSource.charStart, 4)
   assert.equal(fileSource.charEnd, 9)
+})
+
+test('引用正文：文件选区带上路径与行号，模型才知道出处', () => {
+  const harness = makeHarness()
+  const { quoteBody, quoteOriginLine } = harness.debug._internals
+
+  assert.equal(quoteBody({ kind: 'dom' }, '普通选区'), '普通选区', '没有出处就只给原文')
+
+  assert.equal(quoteOriginLine({ kind: 'file', path: 'src/a.ts', lineStart: 12 }), '【src/a.ts:12】', '单行只写一个行号')
+  assert.equal(
+    quoteBody({ kind: 'file', path: 'src/a.ts', lineStart: 12, lineEnd: 18 }, 'let x = 1'),
+    '【src/a.ts:12–18】\nlet x = 1',
+    '多行写成区间，来路单独占一行',
+  )
+  assert.equal(quoteOriginLine({ kind: 'file', lineStart: 3, lineEnd: 5 }), '【第 3–5 行】', '代码预览没有路径时只给行号')
+  assert.equal(quoteOriginLine({ kind: 'message', anchorKey: 'k1' }), '', '对话消息没有行号可写')
+  assert.equal(quoteBody({ kind: 'file', path: 'a.md' }, ''), '', '空引用不产生正文')
+})
+
+test('点引用块写批注：引用原文与来路一起进 source', () => {
+  const harness = makeHarness()
+  const { quoteAnnotationSource } = harness.debug._internals
+
+  assert.deepEqual(quoteAnnotationSource('一段原文', undefined), { kind: 'quote', text: '一段原文' }, '没有来路时只留原文')
+
+  const fromFile = quoteAnnotationSource('一段原文', {
+    kind: 'file',
+    path: 'src/a.ts',
+    lineStart: 12,
+    lineEnd: 18,
+    textOrigin: 'rendered',
+  })
+  assert.equal(fromFile.kind, 'quote')
+  assert.equal(fromFile.path, 'src/a.ts')
+  assert.equal(fromFile.lineStart, 12)
+  assert.equal(fromFile.lineEnd, 18)
+  assert.equal(fromFile.from, 'file')
+  assert.equal(fromFile.textOrigin, 'rendered')
+})
+
+test('引用批注的负载：source.kind 是 quote，出处字段原样带上', () => {
+  const harness = makeHarness()
+  const { payloadSource, buildPayload, describeSource } = harness.debug._internals
+
+  const source = payloadSource({
+    kind: 'quote',
+    text: '一段原文',
+    path: 'src/a.ts',
+    lineStart: 12,
+    lineEnd: 18,
+    from: 'file',
+    textOrigin: 'source',
+  })
+  assert.equal(source.kind, 'quote')
+  assert.equal(source.text, '一段原文')
+  assert.equal(source.path, 'src/a.ts')
+  assert.equal(source.lineStart, 12)
+  assert.equal(source.from, 'file')
+  assert.equal(source.textOrigin, 'source')
+  assert.equal(payloadSource({ kind: 'quote', text: '一段原文' }).textOrigin, undefined, '没有口径就不写')
+
+  const payload = JSON.parse(
+    buildPayload([
+      {
+        number: 1,
+        quote: '一段原文',
+        note: '改这里',
+        source: { kind: 'quote', text: '一段原文', path: 'src/a.ts', lineStart: 12 },
+      },
+    ]),
+  )
+  assert.equal(payload.annotations[0].source.kind, 'quote')
+  assert.match(payload.instruction, /"quote"/, '指令要说明 quote 是什么意思')
+  assert.match(describeSource({ kind: 'quote', path: 'src/a.ts', lineStart: 12 }), /src\/a\.ts:12/)
+})
+
+test('引用批注也要回到原文：有来路就按来路定位，没来路就安静放弃', () => {
+  const harness = makeHarness()
+  const { quoteSourceAnchor, quoteSourceFor } = harness.debug._internals
+
+  assert.deepEqual(
+    quoteSourceAnchor({ quote: '还有问题', source: { kind: 'quote', text: '还有问题', anchorKey: 'k1', charStart: 3, charEnd: 7 } }),
+    { kind: 'message', anchorKey: 'k1', role: undefined, flowKind: undefined, charStart: 3, charEnd: 7 },
+    '带锚点的引用：回到那条消息的字符区间',
+  )
+  const fromFile = quoteSourceAnchor({
+    quote: '【src/a.ts:12】\nlet x = 1',
+    source: { kind: 'quote', text: '【src/a.ts:12】\nlet x = 1', sourceUrl: 'dsh-resource://file/session/s/a.ts', path: 'src/a.ts' },
+  })
+  assert.equal(fromFile.kind, 'file', '带预览 url 的引用：回到文件那一处')
+  assert.equal(fromFile.path, 'src/a.ts')
+  assert.equal(fromFile.charStart, undefined, '没有字符区间就不编一个出来')
+
+  assert.equal(quoteSourceAnchor({ quote: '找不到的原话', source: { kind: 'quote', text: '找不到的原话' } }), undefined, '页面里也找不到就放弃，不要乱标')
+
+  const carried = { kind: 'quote', text: '还有问题', anchorKey: 'k1' }
+  assert.equal(quoteSourceFor('还有问题', carried), carried, '已经带着来路就原样保留，不做多余推断')
+  assert.equal(quoteSourceFor('还有问题', { kind: 'message', anchorKey: 'k2' }).kind, 'message', '非 quote 来源不参与推断')
+})
+
+test('引用原文口径：剥掉来路行，同一句原文才算同一条批注', () => {
+  const harness = makeHarness()
+  const { quoteExcerptOf, annotationOnQuote } = harness.debug._internals
+
+  assert.equal(quoteExcerptOf('【src/a.ts:12–18】\nlet x = 1'), 'let x = 1', '来路行不算原文')
+  assert.equal(quoteExcerptOf('普通选区'), '普通选区', '没有来路行就原样返回')
+  assert.equal(quoteExcerptOf(''), '', '空串不炸')
+
+  harness.debug.add({
+    quote: '还有问题',
+    note: '改成陈述句',
+    source: { kind: 'message', anchorKey: 'k1', flowKind: 'user' },
+  })
+  assert.equal(annotationOnQuote('还有问题')?.note, '改成陈述句', '从消息里引用过来时对得上同一条')
+  assert.equal(
+    annotationOnQuote('【src/a.ts:3】\n还有问题', { kind: 'file', path: 'src/a.ts', lineStart: 3 }),
+    undefined,
+    '来路对不上就不是同一条（消息里的那句 vs 文件里的一句）',
+  )
+
+  harness.debug.add({
+    quote: 'let x = 1',
+    note: '这里改成 const',
+    source: { kind: 'file', path: 'src/a.ts', lineStart: 12, lineEnd: 18 },
+  })
+  assert.equal(
+    annotationOnQuote('【src/a.ts:12–18】\nlet x = 1', { kind: 'file', path: 'src/a.ts', lineStart: 12, lineEnd: 18 })?.note,
+    '这里改成 const',
+    '同一文件同一行的引用就是同一条',
+  )
+  assert.equal(
+    annotationOnQuote('【src/other.ts:12–18】\nlet x = 1', { kind: 'file', path: 'src/other.ts', lineStart: 12, lineEnd: 18 }),
+    undefined,
+    '别的文件里的同一句是另一条批注',
+  )
+})
+
+test('输入态没有引用能力时安静降级：读写引用都不抛错', () => {
+  const harness = makeHarness()
+  assert.deepEqual(harness.debug.quotes(), [], '拿不到投影就当没有引用')
+  assert.equal(harness.debug.insertQuote('一段原文'), false, '没有 inputActions 时插引用直接放弃')
 })

@@ -42,29 +42,59 @@ window.__ModuleLoader__.load({
     const ORPHAN_SWEEP_MS = 1500
     /** 首次上传最多为在途的位置精修等多久 —— 精修通常几十毫秒，这只是个上限。 */
     const REFINE_WAIT_MS = 1200
+    /** 引用插入后等多久再弹批注框（Lexical 渲染引用块是异步的）。 */
+    const QUOTE_PROMPT_MS = 80
+    /** 距上一次用户手势超过这么久的新增引用，一律当作草稿恢复、不是刚插入。 */
+    const QUOTE_GESTURE_MS = 2500
     /** 发出后仍可能被运行时 restore 回来的孤儿附件，要盯多久。 */
     const STRAY_GUARD_MS = 120000
+    /** 一条「来路」里值得原样保留的字段：负载要用，回到原文画标记也要用。 */
+    const ORIGIN_KEYS = [
+      'path',
+      'sourceUrl',
+      'lineStart',
+      'lineEnd',
+      'charStart',
+      'charEnd',
+      'textOrigin',
+      'role',
+      'anchorKey',
+      'flowKind',
+    ]
 
     const CSS = `
 .sa-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 60; }
 .sa-hl { position: fixed; pointer-events: none; border-radius: 3px;
   background: rgb(255 208 66 / 0.45); box-shadow: inset 0 -1px 0 rgb(255 176 0 / 0.75); }
+/* 引用块上的批注标记：不再自绘浮层（会和官方引用块重叠），只给引用原文加一条下划线。 */
+[data-quote-preview][data-sa-number] { position: relative; }
+[data-quote-preview][data-sa-number]::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0;
+  height: 2px; border-radius: 2px; background: rgb(36 123 191 / 0.9); pointer-events: none; }
+/* 批注 JSON 的附件卡片只是给宿主的信道：用户看到的「批注」就是输入框里的引用块，卡片本身不显示。 */
+[data-sa-payload] { display: none !important; }
 .sa-badge { position: fixed; pointer-events: auto; cursor: pointer; font: inherit; border: none; padding: 0 3px; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box;
   display: inline-flex; align-items: center; justify-content: center; border-radius: 8px;
-  background: var(--dsw-alias-brand-primary, #247bbf); color: #fff; font-size: 10px; line-height: 1;
+  /* 主题的 brand 变量在这套配色里是浅色，白字会糊成一片 —— 角标固定蓝底白字。 */
+  background: #247bbf; color: #fff; font-size: 10px; line-height: 1;
   font-weight: 600; font-variant-numeric: tabular-nums; }
 .sa-toolbar { position: fixed; display: none; z-index: 61; }
-.sa-toolbar[data-open="1"] { display: block; }
+.sa-toolbar[data-open="1"] { display: flex; gap: 6px; }
 .sa-btn { font: inherit; font-size: 12px; line-height: 1; padding: 6px 10px; cursor: pointer;
-  color: var(--dsw-alias-label-primary, CanvasText); background: var(--dsw-alias-bg-overlay, Canvas);
+  color: var(--dsw-alias-label-primary, CanvasText); background: var(--dsw-alias-bg-layer-1, Canvas);
   border: 1px solid var(--dsw-alias-border-l2, ButtonBorder); border-radius: 7px;
   box-shadow: 0 4px 14px rgba(0,0,0,.18); }
 .sa-btn:hover { border-color: var(--dsw-alias-brand-primary, #247bbf); color: var(--dsw-alias-brand-primary, #247bbf); }
+/* 主题里的 brand 变量在不同配色下深浅不一，白字容易糊成一片 —— 主按钮用固定的蓝底白字。 */
+.sa-btn.sa-primary { color: #fff; background: #247bbf; border-color: #247bbf; font-weight: 600; }
+.sa-btn.sa-primary:hover { color: #fff; background: #1f6aa6; border-color: #1f6aa6; }
+.sa-btn:disabled { opacity: .5; cursor: default; }
 .sa-popover { position: fixed; display: none; z-index: 62; width: 340px; max-width: calc(100vw - 24px);
   padding: 10px; box-sizing: border-box; border-radius: 10px; color: var(--dsw-alias-label-primary, CanvasText);
-  background: var(--dsw-alias-bg-overlay, Canvas); border: 1px solid var(--dsw-alias-border-l2, ButtonBorder);
+  background: var(--dsw-alias-bg-layer-1, Canvas); border: 1px solid var(--dsw-alias-border-l2, ButtonBorder);
   box-shadow: 0 10px 32px rgba(0,0,0,.24); }
 .sa-popover[data-open="1"] { display: block; }
+.sa-popover[data-mode="note"], .sa-popover[data-mode="note-edit"] { width: 300px; padding: 8px; border-radius: 12px; }
+.sa-popover[data-mode="note"] .sa-pop-input, .sa-popover[data-mode="note-edit"] .sa-pop-input { min-height: 54px; border-radius: 8px; }
 .sa-pop-title { font-size: 12px; font-weight: 600; margin: 0 0 6px; }
 .sa-pop-quote { max-height: 120px; overflow: auto; margin: 0 0 8px; padding: 6px 8px; font-size: 12px;
   white-space: pre-wrap; word-break: break-word; color: var(--dsw-alias-label-secondary, GrayText);
@@ -120,7 +150,7 @@ window.__ModuleLoader__.load({
      */
     const log = (message, ...rest) => {
       try {
-        log(message, ...rest)
+        console.log(message, ...rest)
       } catch {
         /* 日志失败无所谓 */
       }
@@ -146,6 +176,8 @@ window.__ModuleLoader__.load({
         /** 由槽位标准 props 注入的 composer 动作与当前会话 id —— 比自行解析 scope 更稳。 */
         let latestInputActions = undefined
         let latestSessionId = undefined
+        /** 输入框里每条引用块的来路（按引用正文索引）：点它写批注时把文件/消息出处带上。 */
+        const quoteOrigins = new Map()
         /** 批注集合归属的会话；切换会话即清空，避免批注跑到别的会话里。 */
         let annotationsSession = undefined
         /** 批注附件是否已被 composer 确认挂上（用来区分「还没同步」与「已被发送消费」）。 */
@@ -757,20 +789,257 @@ window.__ModuleLoader__.load({
           return normalize(current) === normalize(quote)
         }
 
-        /** 定位一条批注的当前 Range：活的 Range 优先，失效就按锚点 + 偏移重建。 */
-        function locateRange(item) {
-          if (item.liveRange !== undefined) {
-            const live = item.liveRange
+        /**
+         * 定位一条批注的当前 Range：活的 Range 优先，失效就按锚点 + 偏移重建。
+         * @param item - 带 quote / source 的定位目标。
+         * @param cache - 活 Range 的缓存宿主，默认就是 item 自己；引用批注会传入一个临时对象，
+         *   因为它每次定位用的来源是折出来的（见 paintSourceRange），不适合挂在批注上。
+         */
+        function locateRange(item, cache = item) {
+          if (cache.liveRange !== undefined) {
+            const live = cache.liveRange
             const usable =
               safe(() => live.startContainer.isConnected === true && live.endContainer.isConnected === true) === true
             if (usable && rangeMatchesQuote(live, item.quote)) return live
-            item.liveRange = undefined
+            cache.liveRange = undefined
           }
           const root = anchorRoot(item.source)
           if (root === null || root === undefined) return undefined
           const range = matchInRoot(root, item.quote, item.source.charStart)
-          if (range !== undefined) item.liveRange = range
+          if (range !== undefined) cache.liveRange = range
           return range
+        }
+
+        /* ------------------------------------------------------------------ 引用（composer quote） */
+
+        /**
+         * 输入框里当前所有引用块，按草稿顺序。
+         *
+         * 读的是 composer 投影（shell.projection.quotes），不是引用块的 DOM 文案 ——
+         * 后者会把「移除」按钮的文字也算进 textContent。
+         */
+        function quoteEntries() {
+          const shell = inputShell()
+          if (shell === null || shell === undefined) return []
+          const quotes = safe(() => shell.projection?.quotes)
+          if (Array.isArray(quotes) !== true) return []
+          return quotes.filter(
+            (entry) => entry !== null && typeof entry === 'object' && typeof entry.text === 'string',
+          )
+        }
+
+        /** 输入框里所有引用块的宿主元素，按文档顺序 —— 与投影顺序一致。 */
+        function quoteChips() {
+          return [...document.querySelectorAll('[data-composer-quote]')]
+        }
+
+        /** 引用块正文开头那行来路：文件片段得让模型知道出自哪个文件的哪几行。 */
+        function quoteOriginLine(source) {
+          if (source === null || source === undefined) return ''
+          const path = typeof source.path === 'string' && source.path !== '' ? source.path : ''
+          const hasLines = Number.isFinite(source.lineStart)
+          const span = hasLines
+            ? Number.isFinite(source.lineEnd) && source.lineEnd !== source.lineStart
+              ? `${source.lineStart}–${source.lineEnd}`
+              : `${source.lineStart}`
+            : ''
+          if (path === '') return span === '' ? '' : `【第 ${span} 行】`
+          return span === '' ? `【${path}】` : `【${path}:${span}】`
+        }
+
+        /** 引用块正文 = 可选的来路行 + 原文。 */
+        function quoteBody(source, quote) {
+          const text = typeof quote === 'string' ? quote : ''
+          if (text === '') return ''
+          const line = quoteOriginLine(source)
+          return line === '' ? text : `${line}\n${text}`
+        }
+
+        /**
+         * 引用块正文里的「原文」：剥掉开头那行「【path:12–18】」来路。
+         *
+         * 文件片段 / 消息片段的引用正文第一行是来路，正文从第二行开始；批注里的 quote 有时是
+         * 带行号的整段（点引用块写下的），有时只是原文（从选区写下的）—— 比「是不是同一段」时
+         * 两边都折成这个口径。
+         * @param text - 引用正文或批注原文。
+         */
+        function quoteExcerptOf(text) {
+          const body = typeof text === 'string' ? text : ''
+          const index = body.indexOf('\n')
+          if (index <= 0) return body
+          const head = body.slice(0, index)
+          return head.startsWith('【') && head.endsWith('】') ? body.slice(index + 1) : body
+        }
+
+        /**
+         * 输入框里的这段引用，是不是已经有一条批注了。
+         *
+         * 不按来源分类：用户先给消息里的原文写批注、随后又把它「引用」进输入框，看到的仍然是
+         * 同一段原文，再点引用应该编辑那条批注，而不是又添一条。但同一句话出现在两个文件里
+         * 就是两回事 —— 引用正文带来路行（【path:12–18】）时，来路也要对得上才算同一条。
+         * @param text - 引用块正文（可能带【path:行号】）。
+         * @param source - 这段引用的出处（用来比来路；没有就只比原文）。
+         */
+        function annotationOnQuote(text, source) {
+          const excerpt = quoteExcerptOf(text)
+          if (excerpt === '') return undefined
+          const line = quoteOriginLine(source)
+          return annotations.find((item) => {
+            if (item.quote === text) return true
+            if (quoteExcerptOf(item.quote) !== excerpt) return false
+            return quoteOriginLine(item.source) === line
+          })
+        }
+
+        /** 往输入框插入一条引用。返回是否真的插进去了（只读/冻结态会被官方拒绝）。 */
+        function insertQuote(text) {
+          const body = typeof text === 'string' ? text.trim().slice(0, MAX_QUOTE) : ''
+          if (body === '') return false
+          const actions = latestInputActions
+          if (actions === null || actions === undefined || typeof actions.insertQuote !== 'function') {
+            warn('[selection-annotations] 当前输入态不支持插入引用，批注本身不受影响')
+            return false
+          }
+          let inserted = false
+          safe(() => {
+            inserted = actions.insertQuote(body) === true
+          })
+          if (!inserted) warn('[selection-annotations] 插入引用被拒绝（输入框可能处于只读或冻结态）')
+          return inserted
+        }
+
+        /** 这段文字是不是已经在输入框里引用了（同一段插两次没有意义）。 */
+        function hasQuoteText(text) {
+          return quoteEntries().some((entry) => entry.text === text)
+        }
+
+        /**
+         * 记下某条引用块的来路，之后点它写批注时把出处带上。
+         *
+         * 存的是**整份来源**（含 anchorKey / 字符区间 / 预览 url）：批注落在引用上之后，
+         * 还要回到原文那一处画标记 —— 只留路径与行号就不够定位消息里的那段话了。
+         */
+        function rememberQuoteOrigin(text, source) {
+          if (typeof text !== 'string' || text === '') return
+          if (source === null || source === undefined) return
+          if (source.kind !== 'file' && source.kind !== 'message') return
+          const origin = {}
+          for (const key of ORIGIN_KEYS) {
+            const value = source[key]
+            if (value === undefined || value === null || value === '') continue
+            origin[key] = value
+          }
+          origin.kind = source.kind
+          quoteOrigins.set(text, origin)
+          // 只留最近几十条：这层只是点引用块时的提示，不是真相来源。
+          while (quoteOrigins.size > 40) {
+            const oldest = quoteOrigins.keys().next()
+            if (oldest.done === true) break
+            quoteOrigins.delete(oldest.value)
+          }
+        }
+
+        /** 把一条引用块变成批注目标：引用原文 + 可选的来路（字段原样带过来）。 */
+        function quoteAnnotationSource(text, origin) {
+          const source = { kind: 'quote', text }
+          if (origin === null || origin === undefined) return source
+          for (const key of ORIGIN_KEYS) {
+            const value = origin[key]
+            if (value === undefined || value === null || value === '') continue
+            source[key] = value
+          }
+          if (origin.kind === 'file' || origin.kind === 'message') source.from = origin.kind
+          return source
+        }
+
+        /** 找一条引用批注对应的引用块：记过的元素优先，其次按引用文本对齐投影顺序。 */
+        /** 引用被移除时，连同挂在它上面的批注一起忘掉（引用和批注是同一条记录的两种形态）。 */
+        function forgetQuoteAnnotation(text) {
+          if (typeof text !== 'string' || text === '') return
+          const origin = quoteOrigins.get(text)
+          const existing = annotationOnQuote(text, quoteAnnotationSource(text, origin))
+          quoteOrigins.delete(text)
+          if (existing !== undefined) removeAnnotation(existing.id)
+          else scheduleRepaint()
+        }
+
+        function quoteChipOf(item) {
+          const remembered = item?.quoteAnchor
+          if (remembered !== null && remembered !== undefined && remembered.isConnected === true) return remembered
+          const chips = quoteChips()
+          if (chips.length === 0) return null
+          const entries = quoteEntries()
+          const wanted = typeof item?.quote === 'string' ? item.quote : ''
+          if (wanted !== '' && entries.length === chips.length) {
+            const exact = entries.findIndex((entry) => entry.text === wanted)
+            // 批注存的是原文，引用块正文可能带着「【path:行号】」来路行：整段对不上就按原文对。
+            const index = exact >= 0 ? exact : entries.findIndex((entry) => quoteExcerptOf(entry.text) === quoteExcerptOf(wanted))
+            if (index >= 0 && chips[index] !== undefined) return chips[index]
+          }
+          return null
+        }
+
+        /**
+         * 批注 → 引用：把这条批注的原文也插进输入框，作为它的引用块。
+         *
+         * 用户要的是「批注落在引用上」：引用负责把原文摆到模型眼前，批注块负责说明要改什么。
+         * 插入可能被输入态拒绝（冻结/只读），那也不影响批注本身 —— 只是这条没有引用块可挂。
+         */
+        function attachQuoteToAnnotation(item, quote, source) {
+          if (item === null || item === undefined) return
+          const body = quoteBody(source, quote)
+          if (body === '') return
+          const already = hasQuoteText(body)
+          if (!already) {
+            // 这条引用是批注流程自己插的：别再弹一次批注输入框。
+            suppressQuotePrompt += 1
+            if (!insertQuote(body)) {
+              suppressQuotePrompt -= 1
+              return
+            }
+            rememberQuoteOrigin(body, source)
+          }
+          annotations = annotations.map((entry) => (entry.id === item.id ? { ...entry, viaQuote: true } : entry))
+          emit()
+          scheduleSync()
+          scheduleRepaint()
+        }
+
+        /**
+         * 把草稿里那张「批注.json」卡片藏起来。
+         *
+         * 它只是把批注送进宿主的信道（原生文件附件），不是给人看的东西 —— 用户看到的批注就是
+         * 输入框里那条引用块。不能摘掉附件（摘了宿主就收不到批注），只隐藏；批注清空时由
+         * 附件同步自然摘掉。已发消息里的同名附件卡片不动（那是历史，也可能是用户自己传的）。
+         */
+        function hidePayloadCards() {
+          for (const marked of document.querySelectorAll('[data-sa-payload]')) {
+            safe(() => marked.removeAttribute('data-sa-payload'))
+          }
+          for (const card of document.querySelectorAll(`[title="${ANNOTATION_FILE}"]`)) {
+            const element = elementOf(card)
+            if (element === null) continue
+            if (element.closest('[data-composer-card]') === null) continue
+            // 卡片外面还套着一层轨道条目：只藏卡片会留下空隙，能一起藏就一起藏。
+            const holder = element.parentElement
+            const host = holder !== null && holder.childNodes.length === 1 ? holder : element
+            safe(() => host.setAttribute('data-sa-payload', '1'))
+          }
+        }
+
+        /** 给引用块挂上「点击写批注」的提示。只挂一次，热重绘时不会反复写属性。 */
+        function decorateQuoteChips() {
+          // 编号由 repaint 重新打：上一轮留下的必须先清掉，否则删掉批注后下划线还在。
+          for (const marked of document.querySelectorAll('[data-sa-number]')) {
+            safe(() => marked.removeAttribute('data-sa-number'))
+          }
+          for (const chip of quoteChips()) {
+            if (chip.getAttribute('data-sa-quote') === '1') continue
+            safe(() => {
+              chip.setAttribute('data-sa-quote', '1')
+              chip.setAttribute('title', '点击为这条引用写批注')
+            })
+          }
         }
 
         /* ------------------------------------------------------------------ 批注集合 */
@@ -795,6 +1064,7 @@ window.__ModuleLoader__.load({
             note,
             source,
             liveRange: input.liveRange,
+            quoteAnchor: input.quoteAnchor,
             createdAt: Date.now(),
           }
           annotations = [...annotations, item]
@@ -854,7 +1124,48 @@ window.__ModuleLoader__.load({
             }
             return `工作区文件 \`${path}\`${where}`
           }
+          if (source.kind === 'quote') {
+            const line = quoteOriginLine(source)
+            return line === '' ? '输入框引用' : `输入框引用 ${line}`
+          }
           return '页面选区'
+        }
+
+        /**
+         * 负载条目：**输入框里每一条引用都是一条记录**，写了描述的只是多了 note。
+         *
+         * 编号与界面角标同源（第 i 条引用就是第 i+1 号），所以模型看到的 index 与用户看到的
+         * 数字对得上 —— 用户说「4 条引用 3 个批注」时，数据块里就是 4 条记录、3 条带 note。
+         * 输入框里已经没有对应引用的批注（消息发出后、或那条引用被删了）接在后面继续编号。
+         */
+        function payloadItems() {
+          const entries = quoteEntries()
+          const items = []
+          const seen = new Set()
+          for (let index = 0; index < entries.length; index += 1) {
+            const text = entries[index].text
+            const fallback = quoteAnnotationSource(text, quoteOrigins.get(text))
+            const item = annotationOnQuote(text, fallback)
+            if (item !== undefined) seen.add(item.id)
+            items.push({
+              number: index + 1,
+              quote: quoteExcerptOf(text),
+              note: item?.note ?? '',
+              source: item?.source ?? fallback,
+            })
+          }
+          let extra = entries.length
+          for (const item of annotations) {
+            if (seen.has(item.id)) continue
+            extra += 1
+            items.push({
+              number: extra,
+              quote: quoteExcerptOf(item.quote),
+              note: item.note,
+              source: item.source,
+            })
+          }
+          return items
         }
 
         /**
@@ -877,8 +1188,17 @@ window.__ModuleLoader__.load({
                 'charStart/charEnd 是半开区间 [charStart, charEnd)，口径由 source.textOrigin 指明：' +
                 '"source" = 文件原文的字符偏移，"rendered" = 该锚点元素渲染后正文的字符偏移。' +
                 '工作区文件但凡能读到原文就给 "source"；拿不到原文（或引文跨了 Markdown 标记）时退回 "rendered"。' +
+                '若某条的 source.kind 是 "quote"，表示用户是在输入框的引用块上写下的这条批注：' +
+                'source.text 就是那条引用的原文（它同时也以 Markdown 引用块出现在用户消息正文里），' +
+                'source.path + lineStart/lineEnd 是这段原文的文件出处，source.anchorKey + charStart/charEnd 是它在对话消息里的位置，' +
+                'source.from 说明它来自文件还是对话。' +
+                '这类批注不必再复述一遍引用内容，直接按批注要求处理即可。' +
+                'annotations 按用户界面上的编号排列：index 就是用户在引用块、以及原文处的编号角标上看到的那个序号，' +
+                '第 i 条引用就是第 i 号；接口里出现 note 为空字符串的条目，表示这段原文只是被引用、用户没有写描述，' +
+                '除非用户正文另有要求，不必专门回应它（count 是条目总数，described 是有描述的条数）。' +
                 '请按 index 逐条对照回应。',
               count: items.length,
+              described: items.filter((item) => typeof item.note === 'string' && item.note.trim() !== '').length,
               annotations: items.map((item) => ({
                 index: item.number,
                 quote: item.quote,
@@ -902,9 +1222,19 @@ window.__ModuleLoader__.load({
             if (typeof source.path === 'string' && source.path !== '') out.path = source.path
             if (Number.isFinite(source.lineStart)) out.lineStart = source.lineStart
             if (Number.isFinite(source.lineEnd)) out.lineEnd = source.lineEnd
+          } else if (source?.kind === 'quote') {
+            if (typeof source.text === 'string' && source.text !== '') out.text = source.text
+            if (typeof source.path === 'string' && source.path !== '') out.path = source.path
+            if (Number.isFinite(source.lineStart)) out.lineStart = source.lineStart
+            if (Number.isFinite(source.lineEnd)) out.lineEnd = source.lineEnd
+            if (source.from === 'file' || source.from === 'message') out.from = source.from
+            if (typeof source.role === 'string' && source.role !== '') out.role = source.role
+            if (typeof source.anchorKey === 'string' && source.anchorKey !== '') out.anchorKey = source.anchorKey
           }
           if (out.kind === 'file' || out.kind === 'message') {
             out.textOrigin = source?.textOrigin === 'source' ? 'source' : 'rendered'
+          } else if (out.kind === 'quote' && (source?.textOrigin === 'source' || source?.textOrigin === 'rendered')) {
+            out.textOrigin = source.textOrigin
           }
           if (Number.isFinite(source?.charStart)) out.charStart = source.charStart
           if (Number.isFinite(source?.charEnd)) out.charEnd = source.charEnd
@@ -917,6 +1247,14 @@ window.__ModuleLoader__.load({
             syncTimer = null
             void syncAttachment()
           }, UPLOAD_DEBOUNCE_MS)
+        }
+
+        /** 立刻同步，不等防抖：点别处提交批注后马上就要发消息时，不能让附件还停在旧内容上。 */
+        function flushSync() {
+          if (syncTimer === null) return
+          window.clearTimeout(syncTimer)
+          syncTimer = null
+          void syncAttachment()
         }
 
         /** 摘掉一批草稿附件：既要从输入态移除，也要让运行时释放（否则会漏掉后台任务）。 */
@@ -1046,7 +1384,10 @@ window.__ModuleLoader__.load({
 
             if (annotations.length === 0) return
 
-            const file = new File([buildPayload(annotations)], ANNOTATION_FILE, { type: 'application/json' })
+            // 负载按「引用」而不是「批注」计数：只有描述的那些是多出来的 note，
+            // 这样数据块里的条数、编号都与界面上看到的一致。
+            const items = payloadItems()
+            const file = new File([buildPayload(items)], ANNOTATION_FILE, { type: 'application/json' })
             const drafts = conversation.createDrafts(sessionId, [file])
             const ids = Array.isArray(drafts) ? drafts.map((draft) => draft.id).filter((id) => typeof id === 'string') : []
             if (ids.length === 0) return
@@ -1073,7 +1414,8 @@ window.__ModuleLoader__.load({
               releaseDrafts(ids, shell)
               return
             }
-            log(`[selection-annotations] 批注块已挂到本条消息（${annotations.length} 条）`)
+            const described = items.filter((item) => item.note !== '').length
+            log(`[selection-annotations] 批注块已挂到本条消息（${items.length} 条引用，其中 ${described} 条有描述）`)
           } catch (err) {
             warn('[selection-annotations] 批注附件同步失败：', err)
           } finally {
@@ -1098,40 +1440,187 @@ window.__ModuleLoader__.load({
 
         function repaint() {
           overlay.textContent = ''
-          if (annotations.length === 0) return
+          hidePayloadCards()
+          decorateQuoteChips()
+          const entries = quoteEntries()
+          const chips = quoteChips()
+          // 引用和批注是同一样东西：输入框里第 i 条引用就是第 i+1 个标记，
+          // 「批注」只是这条引用多写了一段描述 —— 所以编号必须由引用决定，而不是谁先创建。
+          const numbered = new Set()
+          for (let index = 0; index < entries.length; index += 1) {
+            const text = entries[index].text
+            const fallback = quoteAnnotationSource(text, quoteOrigins.get(text))
+            const item = annotationOnQuote(text, fallback)
+            if (item !== undefined) numbered.add(item.id)
+            const excerpt = quoteExcerptOf(text)
+            const source = quoteSourceAnchor({ quote: text, source: item?.source ?? fallback })
+            if (source !== undefined) {
+              paintSourceRange(
+                {
+                  id: item?.id ?? null,
+                  number: index + 1,
+                  quote: excerpt,
+                  note: item?.note ?? '',
+                  chip: chips[index] ?? null,
+                },
+                source,
+                excerpt,
+              )
+            }
+            // 引用批注也要回到原文那一处：只在引用块上画下划线，等于把「批注在说什么」锁死在输入框里。
+            if (item !== undefined) paintQuoteMark(item, index + 1)
+          }
+          // 输入框里已经没有对应引用的批注（消息发出后、或那条引用被删了）：排在所有引用后面继续编号。
+          let extra = entries.length
           for (const item of annotations) {
-            const range = locateRange(item)
-            if (range === undefined) continue
-            const rects = safe(() => [...range.getClientRects()]) ?? []
-            let badged = false
-            for (const rect of rects) {
-              if (rect.width <= 0 || rect.height <= 0) continue
-              const box = document.createElement('div')
-              box.className = 'sa-hl'
-              box.style.left = `${rect.left}px`
-              box.style.top = `${rect.top}px`
-              box.style.width = `${rect.width}px`
-              box.style.height = `${rect.height}px`
-              overlay.appendChild(box)
-              if (!badged) {
-                badged = true
-                // 角标是唯一的「从正文直接回到这条批注」的入口，必须可点击。
-                const badge = document.createElement('button')
-                badge.type = 'button'
-                badge.className = 'sa-badge'
-                badge.textContent = String(item.number)
-                badge.style.left = `${rect.left - 11}px`
-                badge.style.top = `${rect.top - 8}px`
-                badge.title = item.note === '' ? item.quote : `${item.quote}\n\n批注：${item.note}`
-                badge.addEventListener('click', (event) => {
-                  event.preventDefault()
-                  event.stopPropagation()
+            if (numbered.has(item.id)) continue
+            extra += 1
+            if (item.source?.kind === 'quote') {
+              paintQuoteMark(item, extra)
+              paintQuoteSource(item, extra)
+              continue
+            }
+            paintSourceRange({ ...item, number: extra }, item.source, item.quote)
+          }
+        }
+
+        /**
+         * 在原文处画标记：高亮块 + 首块上的编号角标。
+         * @param item - 归属的批注（角标点击要回到它）。
+         * @param source - 定位来源。
+         * @param quote - 要标出来的原文。
+         */
+        function paintSourceRange(item, source, quote) {
+          const range = locateRange({ id: item.id, source, quote })
+          if (range === undefined) return
+          const rects = safe(() => [...range.getClientRects()]) ?? []
+          let badged = false
+          for (const rect of rects) {
+            if (rect.width <= 0 || rect.height <= 0) continue
+            const box = document.createElement('div')
+            box.className = 'sa-hl'
+            box.style.left = `${rect.left}px`
+            box.style.top = `${rect.top}px`
+            box.style.width = `${rect.width}px`
+            box.style.height = `${rect.height}px`
+            overlay.appendChild(box)
+            if (!badged) {
+              badged = true
+              // 角标是唯一的「从正文直接回到这条批注」的入口，必须可点击。
+              const badge = document.createElement('button')
+              badge.type = 'button'
+              badge.className = 'sa-badge'
+              badge.textContent = String(item.number)
+              // 右上角：贴在高亮块的右端上方，不压住文字。
+              badge.style.left = `${rect.right - 12}px`
+              badge.style.top = `${rect.top - 9}px`
+              badge.title = item.note === '' ? item.quote : `${item.quote}\n\n批注：${item.note}`
+              badge.addEventListener('click', (event) => {
+                event.preventDefault()
+                event.stopPropagation()
+                // 正文批注：改它自己。纯引用：回到输入框里那条引用上写描述。
+                if (typeof item.id === 'string') {
                   openEditPopover(item.id, badge)
-                })
-                overlay.appendChild(badge)
-              }
+                  return
+                }
+                const chip = item.chip ?? quoteChips()[item.number - 1]
+                if (chip === null || chip === undefined) return
+                openQuoteNote(chip, safe(() => badge.getBoundingClientRect()))
+              })
+              overlay.appendChild(badge)
             }
           }
+        }
+
+        /**
+         * 引用批注的定位源。
+         *
+         * 引用记录里带着来路（anchorKey / 预览 url / 字符区间）。可也有两种记录不带来的：
+         * 早期版本只留了 path 与行号；或者这条引用是从草稿恢复、从别处粘进输入框的。
+         * 那就按原文在页面上把它找回来 —— 先找消息行，再找文件预览。
+         */
+        function quoteSourceAnchor(item) {
+          const source = item?.source ?? {}
+          const excerpt = quoteExcerptOf(item?.quote)
+          if (excerpt === '') return undefined
+          if (typeof source.anchorKey === 'string' && source.anchorKey !== '') {
+            return {
+              kind: 'message',
+              anchorKey: source.anchorKey,
+              role: source.role,
+              flowKind: source.flowKind,
+              charStart: source.charStart,
+              charEnd: source.charEnd,
+            }
+          }
+          if (typeof source.sourceUrl === 'string' && source.sourceUrl !== '') {
+            return {
+              kind: 'file',
+              sourceUrl: source.sourceUrl,
+              path: source.path,
+              lineStart: source.lineStart,
+              lineEnd: source.lineEnd,
+              charStart: source.charStart,
+              charEnd: source.charEnd,
+              textOrigin: 'source',
+            }
+          }
+          return inferQuoteSource(excerpt)
+        }
+
+        /** 没有来路时，按原文在页面里找回它出现的锚点：消息行优先，其次文件预览。 */
+        function inferQuoteSource(excerpt) {
+          if (typeof excerpt !== 'string' || excerpt === '') return undefined
+          for (const row of [...document.querySelectorAll('[data-chat-anchor-key]')]) {
+            const at = (row.textContent ?? '').indexOf(excerpt)
+            if (at === -1) continue
+            const flowKind = row.getAttribute('data-chat-flow-kind') ?? undefined
+            return {
+              kind: 'message',
+              anchorKey: row.getAttribute('data-chat-anchor-key') ?? undefined,
+              flowKind,
+              role: flowKind === 'user' || flowKind === 'steering' ? 'user' : 'assistant',
+              charStart: at,
+              charEnd: at + excerpt.length,
+            }
+          }
+          for (const doc of [...document.querySelectorAll('[data-textpreview-url]')]) {
+            const at = (doc.textContent ?? '').indexOf(excerpt)
+            if (at === -1) continue
+            const sourceUrl = doc.getAttribute('data-textpreview-url') ?? undefined
+            return {
+              kind: 'file',
+              sourceUrl,
+              path: sourceUrl === undefined ? undefined : pathFromPreviewUrl(sourceUrl),
+              charStart: at,
+              charEnd: at + excerpt.length,
+              textOrigin: 'rendered',
+            }
+          }
+          return undefined
+        }
+
+        /** 引用批注在原文处的标记：定位源折出来才能画。 */
+        function paintQuoteSource(item, number) {
+          const source = quoteSourceAnchor(item)
+          if (source === undefined) return
+          paintSourceRange({ ...item, number: number ?? item.number }, source, quoteExcerptOf(item.quote))
+        }
+
+        /**
+         * 引用批注的标记：**不自绘任何浮层**。
+         *
+         * 引用块自己就是官方的气泡（悬浮显示全文 + 移除按钮），我们再叠一个虚线框和角标只会打架。
+         * 这里只给引用原文的 [data-quote-preview] 打上编号，CSS 负责画下划线；点引用块进批注。
+         * @param item - 引用来源的批注。
+         */
+        function paintQuoteMark(item, number) {
+          const chip = quoteChipOf(item)
+          if (chip === null) return
+          safe(() => {
+            const preview = chip.querySelector('[data-quote-preview]') ?? chip
+            preview.setAttribute('data-sa-number', String(number ?? item.number))
+          })
         }
 
         /* ------------------------------------------------------------------ 选区工具条 */
@@ -1139,6 +1628,12 @@ window.__ModuleLoader__.load({
         const toolbar = document.createElement('div')
         toolbar.className = 'sa-toolbar'
         toolbar.setAttribute('data-sa-ui', 'toolbar')
+        // 「引用」和「批注」并排：前者只把原文搬进输入框，后者才带批注块。
+        const quoteButton = document.createElement('button')
+        quoteButton.type = 'button'
+        quoteButton.className = 'sa-btn'
+        quoteButton.textContent = '引用'
+        toolbar.appendChild(quoteButton)
         const annotateButton = document.createElement('button')
         annotateButton.type = 'button'
         annotateButton.className = 'sa-btn'
@@ -1171,8 +1666,8 @@ window.__ModuleLoader__.load({
         popCancel.textContent = '取消'
         const popSave = document.createElement('button')
         popSave.type = 'button'
-        popSave.className = 'sa-btn'
-        popSave.textContent = '保存'
+        popSave.className = 'sa-btn sa-primary'
+        popSave.textContent = '确认'
         popActions.append(popDelete, popSpacer, popCancel, popSave)
         popover.append(popTitle, popQuote, popSource, popInput, popActions)
 
@@ -1193,6 +1688,27 @@ window.__ModuleLoader__.load({
           if (quote.trim() === '') return null
           if (isExcluded(range.startContainer) || isExcluded(range.endContainer)) return null
           return { range, quote }
+        }
+
+        /** 官方「引用文本」按钮的本地化文案；认不出来时退回「气泡里只有一个按钮」。 */
+        const QUOTE_LABELS = new Set([
+          '引用文本',
+          'Quote text',
+          'テキストを引用',
+          'Texto de cotización',
+          'Texte de citation',
+          'Zitattext',
+          'Текст цитаты',
+          'Citação de texto',
+        ])
+
+        function isOfficialQuoteButton(button) {
+          const label = (button.getAttribute('aria-label') ?? '').trim()
+          if (QUOTE_LABELS.has(label)) return true
+          const surface = button.closest('[data-text-interaction-surface]')
+          if (surface === null) return false
+          // 认不出的语言：官方气泡目前只有一个动作，那就当它是「引用文本」。
+          return surface.querySelectorAll('button').length === 1
         }
 
         function hideToolbar() {
@@ -1223,6 +1739,12 @@ window.__ModuleLoader__.load({
               hideToolbar()
               return
             }
+            // 对话消息里的选区交给官方「引用文本」气泡：我们再并排弹一个按钮只会打架。
+            const startEl = elementOf(selection.range.startContainer)
+            if (startEl !== null && startEl.closest('[data-chat-anchor-key]') !== null) {
+              hideToolbar()
+              return
+            }
             pendingSelection = selection
             toolbar.dataset.open = '1'
             placeAt(toolbar, rect, 8)
@@ -1235,14 +1757,34 @@ window.__ModuleLoader__.load({
         let popoverTargetId = null
 
         function showPopover(options) {
-          popTitle.textContent = options.title
+          const noteMode = options.mode === 'note' || options.mode === 'note-edit'
+          popover.dataset.mode = options.mode
+          popTitle.textContent = noteMode ? '' : options.title
+          popTitle.style.display = noteMode ? 'none' : ''
           popQuote.textContent = options.quote.length > 400 ? `${options.quote.slice(0, 400)}…` : options.quote
-          popQuote.style.display = options.quote === '' ? 'none' : ''
+          // 引用块自己就把原文摆明白了（悬浮卡还能看全文），批注框里再复述一遍只是噪音。
+          popQuote.style.display = noteMode || options.quote === '' ? 'none' : ''
           popSource.textContent = options.sourceText
+          popSource.style.display =
+            noteMode && (options.sourceText === '' || options.sourceText === '输入框引用') ? 'none' : ''
           popInput.value = options.note
+          popInput.placeholder = noteMode ? '添加可选评论…' : '写点什么（可以留空，只标记原文）'
           popoverMode = options.mode
           popoverTargetId = options.targetId ?? null
           popDelete.style.display = options.mode === 'edit' ? '' : 'none'
+          // 引用批注：新建时「跳过」就是点别处（不建批注）；已经有批注时，那个位置给「删除批注」。
+          if (noteMode) {
+            const canDelete = options.mode === 'note-edit'
+            popCancel.style.display = canDelete ? '' : 'none'
+            // 「清空」只清描述，引用本身还在（引用＝标记，描述＝批注）；整条删掉要用引用块上的「移除」。
+            popCancel.textContent = canDelete ? '清空' : '取消'
+            popCancel.title = canDelete ? '清空这段描述，引用会留下' : ''
+            popCancel.dataset.action = canDelete ? 'delete' : 'cancel'
+          } else {
+            popCancel.style.display = ''
+            popCancel.textContent = '取消'
+            popCancel.dataset.action = 'cancel'
+          }
           hideToolbar()
           popover.dataset.open = '1'
           if (options.rect !== undefined && options.rect !== null) placeAt(popover, options.rect, 10)
@@ -1265,6 +1807,161 @@ window.__ModuleLoader__.load({
           })
         }
 
+        /** 把当前选区作为引用插进输入框（文件选区会带上路径/行号）。 */
+        function createQuoteFromSelection() {
+          const selection = pendingSelection
+          if (selection === null) return
+          const source = captureSource(selection.range)
+          const body = quoteBody(source, selection.quote).trim()
+          // 先把原文的位置量下来：插进输入框之后 DOM 变了，这里就量不准了。
+          const rect = safe(() => selection.range.getBoundingClientRect())
+          hideToolbar()
+          if (body === '') return
+          if (!insertQuote(body)) return
+          lastQuoteRect = rect ?? null
+          rememberQuoteOrigin(body, source)
+          safe(() => window.getSelection()?.removeAllRanges())
+          scheduleRepaint()
+        }
+
+        /**
+         * 给输入框里的一条引用写批注。
+         *
+         * 不弹自己的引用气泡（那是官方引用块 + 悬浮全文卡的事），只弹一个输入框；
+         * 留空关掉就等于「只引用、不批注」，不会留下任何批注记录。
+         * @param chip - 被点的（或刚插入的）[data-composer-quote] 元素。
+         * @param rect - 弹框该贴哪儿：插入引用时用原文选区的位置，点引用块时用引用块的位置。
+         */
+        function openQuoteNote(chip, rect) {
+          // 上一个框里已经写了字：先落成批注，再开这一个。
+          if (popover.dataset.open === '1') dismissPopover()
+          const chips = quoteChips()
+          const index = chips.indexOf(chip)
+          if (index < 0) return
+          const entry = quoteEntries()[index]
+          const text = typeof entry?.text === 'string' ? entry.text : ''
+          if (text === '') return
+          const fallbackSource = quoteAnnotationSource(text, quoteOrigins.get(text))
+          // 这条引用之前已经有批注（哪怕是从正文选区写下的）就编辑那一条，别再添一条。
+          const existing = annotationOnQuote(text, fallbackSource)
+          const source = existing?.source ?? fallbackSource
+          popoverAnchor = existing === undefined ? { quote: text, source, range: null, chip } : null
+          showPopover({
+            title: '',
+            quote: '',
+            sourceText: describeSource(source),
+            note: existing?.note ?? '',
+            rect: rect ?? safe(() => chip.getBoundingClientRect()),
+            mode: existing === undefined ? 'note' : 'note-edit',
+            targetId: existing?.id ?? null,
+          })
+        }
+
+        /* ------------------------------------- 插入引用后，自动弹出批注输入 */
+
+        /** 输入框里当前引用的文本序列（投影顺序）。 */
+        function quoteTexts() {
+          return quoteEntries().map((entry) => entry.text)
+        }
+
+        /** 每条引用出现了几次：按次数比对才能分清「新插一条」和「删掉中间一条」。 */
+        function quoteCounts() {
+          const counts = new Map()
+          for (const text of quoteTexts()) counts.set(text, (counts.get(text) ?? 0) + 1)
+          return counts
+        }
+
+        let knownQuotes = new Map()
+        let quoteWatchTimer = null
+        let lastQuoteGestureAt = 0
+        /** 批注流程自己插的引用：不该再把批注框弹回用户脸上。 */
+        let suppressQuotePrompt = 0
+        /** 每块 composer 第一次见到的引用只当基线，不当成「刚插入」。 */
+        const bootstrappedComposers = new WeakSet()
+        /** 刚插入的那条引用的原文位置：批注框要贴在这儿，而不是贴在输入框里的引用块上。 */
+        let lastQuoteRect = null
+
+        /**
+         * 把「已经在那儿」的 composer 全部记成基线。
+         *
+         * 以前只在见到新引用时才把 composer 记进 bootstrappedComposers —— 于是空输入框的第一次插入
+         * 永远被当成基线，批注框一次也弹不出来。基线该按 composer 的挂载时机算，而不是按引用出现的时机算。
+         */
+        function bootstrapComposers() {
+          for (const root of document.querySelectorAll('[data-composer-card],[data-composer-input]')) {
+            bootstrappedComposers.add(root)
+          }
+        }
+
+        function composerRootOf(node) {
+          const element = elementOf(node)
+          if (element === null) return null
+          return element.closest('[data-composer-card],[data-composer-input]') ?? null
+        }
+
+        /**
+         * 引用块是 Lexical 自己渲染的，拦不到 insertQuote 调用，只能看 DOM。
+         *
+         * 三条护栏：①只认比上一轮多出来的引用；②必须刚有过用户手势（切换会话/恢复草稿也会
+         * 改 DOM，但那不是「刚插了一条引用」）；③每块 composer 第一次看到时只记基线、不弹框。
+         * @returns 卸载函数。
+         */
+        function watchInsertedQuotes() {
+          knownQuotes = quoteCounts()
+          bootstrapComposers()
+          const observer = new MutationObserver(() => {
+            // 新挂上来的 composer（发完消息、切会话）先记基线，免得它自带的引用被当成刚插入。
+            bootstrapComposers()
+            if (quoteWatchTimer !== null) return
+            quoteWatchTimer = window.setTimeout(() => {
+              quoteWatchTimer = null
+              promptForInsertedQuote()
+            }, QUOTE_PROMPT_MS)
+          })
+          observer.observe(document.body, { childList: true, subtree: true })
+          return () => observer.disconnect()
+        }
+
+        function promptForInsertedQuote() {
+          const texts = quoteTexts()
+          const counts = quoteCounts()
+          // 负载里每条引用都是一条记录、而且编号由引用顺序决定 —— 引用集合一变（增、删、换序），
+          // 已经发出去的那份批注块就跟界面对不上了，重发一份。
+          const changed =
+            counts.size !== knownQuotes.size ||
+            [...counts].some(([text, count]) => knownQuotes.get(text) !== count)
+          let addedText = null
+          for (const [text, count] of counts) {
+            if (count > (knownQuotes.get(text) ?? 0)) addedText = text
+          }
+          knownQuotes = counts
+          if (changed && annotations.length > 0) scheduleSync()
+          if (addedText === null) return
+          if (suppressQuotePrompt > 0) {
+            suppressQuotePrompt -= 1
+            return
+          }
+          if (Date.now() - lastQuoteGestureAt > QUOTE_GESTURE_MS) return
+          const chip = quoteChips()[texts.lastIndexOf(addedText)]
+          if (chip === undefined) return
+          const root = composerRootOf(chip)
+          // 兜底：真的遇到一块没记过基线的 composer，就静默这一次，别把恢复出来的草稿当新插入。
+          if (root !== null && bootstrappedComposers.has(root) !== true) {
+            bootstrappedComposers.add(root)
+            return
+          }
+          if (popover.dataset.open === '1') return
+          const rect = lastQuoteRect
+          lastQuoteRect = null
+          // 原文那一刻不在视口里（比如刚滚过）就退回引用块，别把框顶到屏幕边缘。
+          const visible =
+            rect !== undefined &&
+            rect !== null &&
+            rect.width > 0 &&
+            rect.bottom > 0 &&
+            rect.top < window.innerHeight
+          openQuoteNote(chip, visible ? rect : undefined)
+        }
         /**
          * 修改一条既有批注。
          * 这是编号角标点击后的默认行为 —— 点它是要改这一条，不是打开列表。
@@ -1272,6 +1969,7 @@ window.__ModuleLoader__.load({
          * @param anchor - 用来定位弹层的元素（角标或列表里的「编辑」按钮）。
          */
         function openEditPopover(id, anchor) {
+          if (popover.dataset.open === '1') dismissPopover()
           const item = annotations.find((candidate) => candidate.id === id)
           if (item === undefined) return
           const measured = safe(() => anchor?.getBoundingClientRect())
@@ -1302,6 +2000,21 @@ window.__ModuleLoader__.load({
           popoverAnchor = null
           popoverTargetId = null
           popoverMode = 'create'
+        }
+
+        /**
+         * 点别处把批注框关掉。
+         *
+         * 框里已经写了字，就**当成已经写下的批注**，不必非得按「确认」——用户写下的东西不该因为
+         * 少按一次按钮而丢掉。空框关掉仍然是「只引用、不批注」；Esc 依旧当取消，不提交。
+         */
+        function dismissPopover() {
+          if ((popoverMode === 'note' || popoverMode === 'note-edit') && popInput.value.trim() !== '') {
+            commitQuoteNote()
+            flushSync()
+            return
+          }
+          closePopover()
         }
 
         /**
@@ -1356,7 +2069,56 @@ window.__ModuleLoader__.load({
           return guarded
         }
 
+        /**
+         * 引用批注最终记下的来源：能补的来路尽量补上。
+         *
+         * 一条引用若没带来路（早期记录、粘贴进来的、草稿恢复的），批注就标不回原文。
+         * 这里按原文在页面上找回它一次，找到就把定位字段写进 source，下次重绘直接可用。
+         */
+        function quoteSourceFor(quote, source) {
+          const base = source ?? { kind: 'quote', text: quote }
+          if (base.kind !== 'quote') return base
+          const carriesAnchor =
+            (typeof base.anchorKey === 'string' && base.anchorKey !== '') ||
+            (typeof base.sourceUrl === 'string' && base.sourceUrl !== '')
+          if (carriesAnchor) return base
+          const inferred = inferQuoteSource(quoteExcerptOf(quote))
+          if (inferred === undefined) return base
+          const merged = { ...base }
+          for (const key of ORIGIN_KEYS) {
+            const value = inferred[key]
+            if (value === undefined || value === null || value === '') continue
+            merged[key] = value
+          }
+          merged.from = inferred.kind
+          return merged
+        }
+
+        /**
+         * 提交引用上的批注。
+         *
+         * 新建时留空等于「没写」——引用留着、批注不建（和点别处跳过同一个结果）。
+         * 改已有的批注时留空只是「不改」，撤掉要用弹层里的「删除」，免得清空输入框就丢数据。
+         */
+        function commitQuoteNote() {
+          const anchor = popoverAnchor
+          const target = popoverTargetId
+          const note = popInput.value.trim()
+          closePopover()
+          if (target !== null) {
+            if (note !== '') updateAnnotation(target, note)
+            return
+          }
+          if (anchor === null || note === '') return
+          const source = quoteSourceFor(anchor.quote, anchor.source)
+          addAnnotation({ quote: anchor.quote, note, source, quoteAnchor: anchor.chip ?? undefined })
+        }
+
         function commitPopover() {
+          if (popoverMode === 'note' || popoverMode === 'note-edit') {
+            commitQuoteNote()
+            return
+          }
           if (popoverMode === 'edit') {
             const target = popoverTargetId
             closePopover()
@@ -1367,20 +2129,34 @@ window.__ModuleLoader__.load({
           if (anchor === null) return
           const note = popInput.value
           closePopover()
+          // 同一段原文（同一来路）已经有一条批注：这次当成编辑它，否则引用块上会叠出两条。
+          const duplicate = annotationOnQuote(quoteBody(anchor.source, anchor.quote), anchor.source)
+          if (duplicate !== undefined) {
+            if (note !== '') updateAnnotation(duplicate.id, note)
+            attachQuoteToAnnotation(duplicate, anchor.quote, anchor.source)
+            return
+          }
           // 先创建：这一段绝不能依赖任何可能失败的东西。
           const created = addAnnotation({
             quote: anchor.quote,
             note,
             source: anchor.source,
-            liveRange: anchor.range,
+            liveRange: anchor.range ?? undefined,
+            quoteAnchor: anchor.chip ?? undefined,
           })
           safe(() => window.getSelection()?.removeAllRanges())
-          // 再异步把位置精修到原文坐标；失败只记日志。
-          if (created !== undefined) {
-            refineSourcePosition(created.id, anchor.source, anchor.quote).catch((err) => {
-              warn('[selection-annotations] 位置精修失败（不影响这条批注）：', err)
-            })
+          if (created === undefined) return
+          // 引用批注：引用块已经在输入框里了，不必再插一条，也没有渲染坐标可精修。
+          if (anchor.source?.kind === 'quote') {
+            scheduleRepaint()
+            return
           }
+          // 正文批注：顺带把原文插成引用块，让这条批注真的落在引用上。
+          attachQuoteToAnnotation(created, anchor.quote, anchor.source)
+          // 再异步把位置精修到原文坐标；失败只记日志。
+          refineSourcePosition(created.id, anchor.source, anchor.quote).catch((err) => {
+            warn('[selection-annotations] 位置精修失败（不影响这条批注）：', err)
+          })
         }
 
         function deleteFromPopover() {
@@ -1397,7 +2173,43 @@ window.__ModuleLoader__.load({
           event.preventDefault()
           openCreatePopover()
         })
-        popCancel.addEventListener('click', () => closePopover())
+        quoteButton.addEventListener('mousedown', (event) => {
+          // 同样要保住选区：插引用用的就是这段选区。
+          event.preventDefault()
+        })
+        quoteButton.addEventListener('click', (event) => {
+          event.preventDefault()
+          createQuoteFromSelection()
+        })
+
+        // 引用块在 Lexical 的 contenteditable 里：用捕获阶段接点击，别让编辑器先移走光标。
+        // 引用块自带「移除」按钮，点它要放行 —— 否则就删不掉这条引用了。
+        document.addEventListener(
+          'click',
+          (event) => {
+            const target = elementOf(event.target)
+            if (target === null) return
+            const chip = target.closest('[data-composer-quote]')
+            if (chip === null) return
+            if (target.closest('button') !== null) {
+              // 官方「移除」把引用整条删掉：引用即标记，标记没了它的批注也不能留在正文里。
+              forgetQuoteAnnotation(quoteEntries()[quoteChips().indexOf(chip)]?.text)
+              return
+            }
+            event.preventDefault()
+            event.stopPropagation()
+            openQuoteNote(chip)
+          },
+          true,
+        )
+        popCancel.addEventListener('click', () => {
+          // 引用批注改到一半不要了：这个位置删掉的只能是批注本身，引用块留在输入框里。
+          if (popCancel.dataset.action === 'delete') {
+            deleteFromPopover()
+            return
+          }
+          closePopover()
+        })
         popSave.addEventListener('click', () => {
           commitPopover()
         })
@@ -1410,7 +2222,7 @@ window.__ModuleLoader__.load({
           if (popover.dataset.open !== '1') return
           const target = elementOf(event.target)
           if (target !== null && target.closest('[data-sa-ui="popover"]') !== null) return
-          closePopover()
+          dismissPopover()
         }, true)
         document.addEventListener('keydown', (event) => {
           if (event.key === 'Escape') {
@@ -1428,6 +2240,13 @@ window.__ModuleLoader__.load({
             const where = Number.isFinite(source.lineStart) ? `${path}:${source.lineStart}` : path
             // 行号是渲染坐标推出来的，未必等于文件真行号 —— 这一点要让用户看见。
             return source.textOrigin === 'source' ? where : `${where}（渲染坐标）`
+          }
+          if (source?.kind === 'quote') {
+            if (typeof source.path === 'string' && source.path !== '') {
+              const where = Number.isFinite(source.lineStart) ? `${source.path}:${source.lineStart}` : source.path
+              return `引用 · ${where}`
+            }
+            return '输入框引用'
           }
           return '选区'
         }
@@ -1479,7 +2298,9 @@ window.__ModuleLoader__.load({
           panelEl.textContent = ''
 
           if (annotations.length === 0) {
-            panelEl.appendChild(el('div', 'sa-hint', '选中回复、消息或文件预览里的文字，点浮动「批注」即可。'))
+            panelEl.appendChild(
+              el('div', 'sa-hint', '选中回复、消息或文件预览里的文字，点浮动「批注」或「引用」；点输入框里的引用也能直接批注。'),
+            )
           }
 
           for (const item of annotations) {
@@ -1492,7 +2313,9 @@ window.__ModuleLoader__.load({
             head.appendChild(button('sa-link', '编辑', () => openEditPopover(item.id, head)))
             head.appendChild(button('sa-link', '删除', () => removeAnnotation(item.id)))
             row.appendChild(head)
-            if (item.quote !== '') row.appendChild(el('div', 'sa-item-quote', item.quote))
+            // 引用来源的原文带着「【path:行号】」来路行，面板里只显示原文，出处由上面的摘要负责。
+            const shownQuote = item.source?.kind === 'quote' ? quoteExcerptOf(item.quote) : item.quote
+            if (shownQuote !== '') row.appendChild(el('div', 'sa-item-quote', shownQuote))
             if (item.note !== '') row.appendChild(el('div', 'sa-item-note', item.note))
             if (typeof item.refineReason === 'string' && item.refineReason !== '') {
               const why = el('div', 'sa-item-why', `位置精修未生效：${item.refineReason}`)
@@ -1508,7 +2331,7 @@ window.__ModuleLoader__.load({
 
           const foot = el('div', 'sa-foot')
           if (annotations.length > 0) foot.appendChild(button('sa-link', '清空', () => clearAnnotations()))
-          foot.appendChild(el('span', 'sa-hint', '发送时批注作为独立块随消息提交'))
+          foot.appendChild(el('span', 'sa-hint', '发送时批注作为独立块随消息提交，原文以引用块随正文发出'))
           panelEl.appendChild(foot)
         }
 
@@ -1630,11 +2453,52 @@ window.__ModuleLoader__.load({
             }
           })
           observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+          const stopQuoteWatch = watchInsertedQuotes()
+          // 只有「刚有过用户手势」的新增引用才弹批注框，避免切换会话时对恢复的草稿误弹。
+          const onQuoteGesture = () => {
+            lastQuoteGestureAt = Date.now()
+          }
+          window.addEventListener('pointerup', onQuoteGesture, true)
+          window.addEventListener('keyup', onQuoteGesture, true)
+          /**
+           * 接管官方「引用文本」按钮：外观仍是官方气泡，插入走我们自己的流程。
+           *
+           * 官方那条动作只做 insertQuote(text)，不记出处 —— 于是「在引用上写的批注」永远标不回原文。
+           * 这里在捕获阶段截住点击，换成 captureSource + rememberQuoteOrigin，再收起官方浮层。
+           */
+          const onQuoteActionClick = (event) => {
+            const target = elementOf(event.target)
+            if (target === null) return
+            const button = target.closest('[data-text-interaction-surface] button')
+            if (button === null || button.closest('[data-sa-ui]') !== null) return
+            if (!isOfficialQuoteButton(button)) return
+            const selection = readSelection()
+            if (selection === null) return
+            // 插入能力不在时把点击还给官方：否则我们吞掉了点击却什么也没插进去。
+            const actions = latestInputActions
+            if (actions === null || actions === undefined || typeof actions.insertQuote !== 'function') return
+            event.preventDefault()
+            event.stopPropagation()
+            const source = captureSource(selection.range)
+            const body = quoteBody(source, selection.quote).trim()
+            const rect = safe(() => selection.range.getBoundingClientRect())
+            if (body === '' || !insertQuote(body)) return
+            lastQuoteRect = rect ?? null
+            rememberQuoteOrigin(body, source)
+            lastQuoteGestureAt = Date.now()
+            safe(() => window.getSelection()?.removeAllRanges())
+            scheduleRepaint()
+          }
+          document.addEventListener('click', onQuoteActionClick, true)
           return () => {
             document.removeEventListener('selectionchange', onSelectionChange)
             window.removeEventListener('scroll', onViewport, true)
             window.removeEventListener('resize', onViewport)
+            window.removeEventListener('pointerup', onQuoteGesture, true)
+            window.removeEventListener('keyup', onQuoteGesture, true)
+            document.removeEventListener('click', onQuoteActionClick, true)
             observer.disconnect()
+            stopQuoteWatch()
           }
         })
 
@@ -1653,16 +2517,18 @@ window.__ModuleLoader__.load({
               note: item.note,
               source: item.source,
             })),
-          payload: () => buildPayload(annotations),
+          payload: () => buildPayload(payloadItems()),
           receipt: () => draftIds[0] ?? null,
           drafts: () => [...draftIds],
           session: () => currentSessionId(),
+          quotes: () => quoteEntries().map((entry) => entry.text),
+          insertQuote: (text) => insertQuote(text),
           repaint,
           remove: removeAnnotation,
           clear: clearAnnotations,
           update: (id, note) => updateAnnotation(id, note),
           add: (input) => addAnnotation(input),
-          _internals: { buildPayload, payloadSource, describeSource, captureSource, matchInRoot, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition },
+          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor },
         }
       },
     }
