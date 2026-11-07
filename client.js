@@ -178,6 +178,8 @@ window.__ModuleLoader__.load({
         let latestSessionId = undefined
         /** 输入框里每条引用块的来路（按引用正文索引）：点它写批注时把文件/消息出处带上。 */
         const quoteOrigins = new Map()
+        /** 正在读原文、补引用来路坐标的引用正文（同一段只读一次）。 */
+        const quoteRefines = new Set()
         /** 批注集合归属的会话；切换会话即清空，避免批注跑到别的会话里。 */
         let annotationsSession = undefined
         /** 批注附件是否已被 composer 确认挂上（用来区分「还没同步」与「已被发送消费」）。 */
@@ -515,14 +517,33 @@ window.__ModuleLoader__.load({
          * 渲染后的正文与原文并不一样（标题丢了 `#`、强调丢了 `**`、链接只剩文字），而且换行、
          * 缩进也会被重排，所以不能直接 `indexOf`：先把两边都做空白折叠再比，命中后把区间映射回
          * 源文本下标。找不到就返回 undefined —— 那时宁可不要行号，也不要给一个错的。
+         * 同一段话在文件里出现多次时（比如都叫 `selection-annotations` 的两行），按捕获时
+         * 记下的行号择优 —— 只有那一行上确实有这段原文才采用，指不到就退回第一处。
+         * @param quote - 引文。
+         * @param preferLine - 捕获时所在的 1 基行号（可选）。
          * @returns { start, end } 源文本里的半开区间。
          */
-        function locateInSource(source, quote) {
+        function locateInSource(source, quote, preferLine) {
           const needle = quote.replace(/\s+/g, ' ').trim()
           if (needle === '') return undefined
           const hay = normalizeWithMap(source)
-          const at = hay.text.indexOf(needle)
-          if (at === -1) return undefined
+          const hits = []
+          let from = 0
+          for (;;) {
+            const at = hay.text.indexOf(needle, from)
+            if (at === -1 || hits.length >= 64) break
+            hits.push(at)
+            from = at + 1
+          }
+          if (hits.length === 0) return undefined
+          let at = hits[0]
+          if (hits.length > 1 && Number.isFinite(preferLine)) {
+            const onLine = hits.find((index) => {
+              const mapped = hay.map[index]
+              return mapped !== undefined && lineOfOffset(source, mapped) === preferLine
+            })
+            if (onLine !== undefined) at = onLine
+          }
           const start = hay.map[at]
           const end = hay.map[at + needle.length - 1]
           if (start === undefined || end === undefined) return undefined
@@ -631,7 +652,7 @@ window.__ModuleLoader__.load({
           const file = unwrapRemote(outcome.value)
           const text = typeof file?.text === 'string' ? file.text : undefined
           if (text === undefined) return skip('返回里没有 text（path 可能不被接受）')
-          const hit = locateInSource(text, quote)
+          const hit = locateInSource(text, quote, source?.lineStart)
           if (hit === undefined) {
             return skip(
               file?.eof === false
@@ -937,6 +958,53 @@ window.__ModuleLoader__.load({
             if (oldest.done === true) break
             quoteOrigins.delete(oldest.value)
           }
+          refineQuoteOrigin(text, origin)
+        }
+
+        /**
+         * 文件引用的来路补正：插入时量到的是**渲染坐标**，这里再折算成原文坐标。
+         *
+         * 我们自己的契约是「工作区文件但凡能读到原文就给 source」。引用是从预览里量出来的，
+         * 只有渲染后正文的偏移（Markdown 预览的行号还会与原文错开），所以插入之后异步读一次
+         * 源文件补上 charStart/charEnd/lineStart/lineEnd。读不到、或引文跨了行内标记，就静默
+         * 留在渲染坐标 —— 引用与批注本身都不受影响。
+         *
+         * @param text - 引用块正文（可能带【path:行号】来路行）。
+         * @param origin - 记在 quoteOrigins 里的那份来路（原地补字段）。
+         */
+        function refineQuoteOrigin(text, origin) {
+          if (origin === null || origin === undefined) return
+          if (origin.kind !== 'file') return
+          if (typeof origin.path !== 'string' || origin.path === '') return
+          if (origin.textOrigin === 'source') return
+          if (quoteRefines.has(text)) return
+          const excerpt = quoteExcerptOf(text)
+          if (excerpt === '') return
+          quoteRefines.add(text)
+          const task = (async () => {
+            const precise = await safe(() =>
+              resolveSourcePosition({ kind: 'file', path: origin.path, lineStart: origin.lineStart }, excerpt),
+            )
+            if (precise === undefined) return
+            // 这段引用可能已经被删掉、或又插了一条同文的：只认当初记下的那一份。
+            if (quoteOrigins.get(text) !== origin) return
+            const existing = annotationOnQuote(text, quoteAnnotationSource(text, origin))
+            Object.assign(origin, precise)
+            quoteOrigins.set(text, origin)
+            if (existing !== undefined) {
+              annotations = annotations.map((item) =>
+                item.id === existing.id ? { ...item, source: { ...item.source, ...precise } } : item,
+              )
+              emit()
+              if (annotations.length > 0) scheduleSync()
+            }
+            scheduleRepaint()
+          })()
+          const done = () => quoteRefines.delete(text)
+          void task.then(done, (err) => {
+            done()
+            warn('[selection-annotations] 引用来路补正失败（不影响引用）：', err)
+          })
         }
 
         /** 把一条引用块变成批注目标：引用原文 + 可选的来路（字段原样带过来）。 */
@@ -2523,12 +2591,14 @@ window.__ModuleLoader__.load({
           session: () => currentSessionId(),
           quotes: () => quoteEntries().map((entry) => entry.text),
           insertQuote: (text) => insertQuote(text),
+          rememberQuoteOrigin: (text, source) => rememberQuoteOrigin(text, source),
+          quoteOrigin: (text) => quoteOrigins.get(text),
           repaint,
           remove: removeAnnotation,
           clear: clearAnnotations,
           update: (id, note) => updateAnnotation(id, note),
           add: (input) => addAnnotation(input),
-          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor },
+          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor, refineQuoteOrigin },
         }
       },
     }

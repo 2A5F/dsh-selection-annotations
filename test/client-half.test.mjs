@@ -938,6 +938,44 @@ test('定位到源文件时给出行号与原文坐标，拿不到就退回渲�
   assert.equal(await resolveSourcePosition({ kind: 'file', path: 'a.md' }, '不在原文里'), undefined)
 })
 
+test('文件引用来路补正：插入后把渲染坐标折算成原文坐标，重复原文按行号择优', async () => {
+  const sourceText = ['alpha', 'name: a-selection-annotations', 'name: b-selection-annotations', ''].join('\n')
+  const harness = makeHarness({ sourceText })
+  const body = '【a.md:3】\non-annot'
+  const origin = {
+    kind: 'file',
+    path: 'a.md',
+    sourceUrl: 'dsh://a.md',
+    lineStart: 3,
+    lineEnd: 3,
+    charStart: 100,
+    charEnd: 108,
+    textOrigin: 'rendered',
+  }
+
+  harness.debug.rememberQuoteOrigin(body, origin)
+  await new Promise((resolve) => setTimeout(resolve, 60))
+
+  const refined = harness.debug.quoteOrigin(body)
+  assert.equal(refined.textOrigin, 'source', '读得到原文就该记成 source 口径')
+  assert.equal(refined.lineStart, 3, '同一段原文出现两次时，按捕获的行号择优')
+  assert.equal(sourceText.slice(refined.charStart, refined.charEnd), 'on-annot')
+  assert.ok(harness.sourceReads.length >= 1, '应当读了一次源文件')
+})
+
+test('读不到源文件时，引用来路安静留在渲染坐标', async () => {
+  const harness = makeHarness({ sourceUnavailable: true })
+  const body = '【a.md:1】\nalpha'
+  const origin = { kind: 'file', path: 'a.md', lineStart: 1, lineEnd: 1, charStart: 0, charEnd: 5, textOrigin: 'rendered' }
+
+  harness.debug.rememberQuoteOrigin(body, origin)
+  await new Promise((resolve) => setTimeout(resolve, 60))
+
+  const kept = harness.debug.quoteOrigin(body)
+  assert.equal(kept.textOrigin, 'rendered', '精修失败不得改写口径')
+  assert.equal(kept.charStart, 0, '坐标保持原样')
+})
+
 test('remote 拿不到时，位置精修安静失败而不是把异常抛给创建流程', async () => {
   const harness = makeHarness({ remoteThrows: true })
   const { resolveSourcePosition } = harness.debug._internals
