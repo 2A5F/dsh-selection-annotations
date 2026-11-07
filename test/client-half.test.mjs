@@ -1150,6 +1150,41 @@ test('引用批注也要回到原文：有来路就按来路定位，没来路�
   assert.equal(quoteSourceFor('还有问题', { kind: 'message', anchorKey: 'k2' }).kind, 'message', '非 quote 来源不参与推断')
 })
 
+test('引用补正成原文坐标后，页面里仍按渲染坐标挑重复原文', () => {
+  const harness = makeHarness()
+  const { quoteSourceAnchor, matchInRoot, payloadSource } = harness.debug._internals
+
+  const firstText = '- id: selection-annotations\n'
+  const secondText = '  u2a5f/dsh-selection-annotations\n'
+  const lineA = harness.env.element('div', { 'data-textpreview-line': '2' }, [harness.env.node(firstText)])
+  const lineB = harness.env.element('div', { 'data-textpreview-line': '3' }, [harness.env.node(secondText)])
+  const pre = harness.env.element('div', { 'data-textpreview-url': 'dsh-resource://file/session/s1/a.yml' }, [lineA, lineB])
+  harness.env.setRangeRoot(pre)
+
+  const renderedStart = firstText.length + secondText.indexOf('on-annotations')
+  const anchor = quoteSourceAnchor({
+    quote: '【a.yml:3】\non-annotations',
+    source: {
+      kind: 'quote',
+      text: '【a.yml:3】\non-annotations',
+      sourceUrl: 'dsh-resource://file/session/s1/a.yml',
+      path: 'a.yml',
+      lineStart: 3,
+      textOrigin: 'source',
+      // 补正写进来的原文坐标：在渲染正文里比第二处还大得多
+      charStart: 120,
+      renderedCharStart: renderedStart,
+    },
+  })
+  assert.equal(anchor.renderedCharStart, renderedStart, '渲染坐标必须跟着定位源走，否则择优就没了依据')
+
+  const range = matchInRoot(pre, 'on-annotations', anchor.renderedCharStart)
+  assert.equal(range.startContainer, lineB.childNodes[0], '必须落在第二处，而不是退回首处')
+  assert.equal(matchInRoot(pre, 'on-annotations', 0).startContainer, lineA.childNodes[0], '反过来拿一个不在此坐标系的偏移去择优，就会漂回首处')
+
+  assert.equal(payloadSource(anchor).renderedCharStart, undefined, '渲染坐标只是页面定位用的，不进负载')
+})
+
 test('引用原文口径：剥掉来路行，同一句原文才算同一条批注', () => {
   const harness = makeHarness()
   const { quoteExcerptOf, annotationOnQuote } = harness.debug._internals

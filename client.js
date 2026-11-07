@@ -56,6 +56,10 @@ window.__ModuleLoader__.load({
       'lineEnd',
       'charStart',
       'charEnd',
+      // 渲染坐标要单独留一份：charStart/charEnd 会升级成原文坐标（给负载用），
+      // 但页面里定位要高亮的仍是渲染后的正文，两者不能混用。
+      'renderedCharStart',
+      'renderedCharEnd',
       'textOrigin',
       'role',
       'anchorKey',
@@ -663,6 +667,9 @@ window.__ModuleLoader__.load({
           return {
             charStart: hit.start,
             charEnd: hit.end,
+            // 原文坐标给负载用；页面里那处高亮仍按渲染坐标找，所以原样留一份。
+            ...(Number.isFinite(source?.charStart) ? { renderedCharStart: source.charStart } : {}),
+            ...(Number.isFinite(source?.charEnd) ? { renderedCharEnd: source.charEnd } : {}),
             lineStart: lineOfOffset(text, hit.start),
             lineEnd: lineOfOffset(text, Math.max(hit.start, hit.end - 1)),
             textOrigin: 'source',
@@ -826,7 +833,13 @@ window.__ModuleLoader__.load({
           }
           const root = anchorRoot(item.source)
           if (root === null || root === undefined) return undefined
-          const range = matchInRoot(root, item.quote, item.source.charStart)
+          // 择优用的偏移必须是**渲染坐标**：charStart 升级成原文坐标后，拿它去比渲染正文只会更偏。
+          const savedOffset = Number.isFinite(item.source?.renderedCharStart)
+            ? item.source.renderedCharStart
+            : item.source?.textOrigin === 'source'
+              ? undefined
+              : item.source?.charStart
+          const range = matchInRoot(root, item.quote, savedOffset)
           if (range !== undefined) cache.liveRange = range
           return range
         }
@@ -983,7 +996,16 @@ window.__ModuleLoader__.load({
           quoteRefines.add(text)
           const task = (async () => {
             const precise = await safe(() =>
-              resolveSourcePosition({ kind: 'file', path: origin.path, lineStart: origin.lineStart }, excerpt),
+              resolveSourcePosition(
+                {
+                  kind: 'file',
+                  path: origin.path,
+                  lineStart: origin.lineStart,
+                  charStart: origin.renderedCharStart ?? origin.charStart,
+                  charEnd: origin.renderedCharEnd ?? origin.charEnd,
+                },
+                excerpt,
+              ),
             )
             if (precise === undefined) return
             // 这段引用可能已经被删掉、或又插了一条同文的：只认当初记下的那一份。
@@ -1619,6 +1641,9 @@ window.__ModuleLoader__.load({
               flowKind: source.flowKind,
               charStart: source.charStart,
               charEnd: source.charEnd,
+              // 渲染坐标要一起带过来，否则重复原文只能取第一处。
+              ...(Number.isFinite(source.renderedCharStart) ? { renderedCharStart: source.renderedCharStart } : {}),
+              ...(Number.isFinite(source.renderedCharEnd) ? { renderedCharEnd: source.renderedCharEnd } : {}),
             }
           }
           if (typeof source.sourceUrl === 'string' && source.sourceUrl !== '') {
@@ -1630,6 +1655,9 @@ window.__ModuleLoader__.load({
               lineEnd: source.lineEnd,
               charStart: source.charStart,
               charEnd: source.charEnd,
+              // charStart 补正后是原文坐标，页面里那处高亮要靠渲染坐标择优 —— 丢了就会退回首处。
+              ...(Number.isFinite(source.renderedCharStart) ? { renderedCharStart: source.renderedCharStart } : {}),
+              ...(Number.isFinite(source.renderedCharEnd) ? { renderedCharEnd: source.renderedCharEnd } : {}),
               textOrigin: 'source',
             }
           }
@@ -2598,7 +2626,7 @@ window.__ModuleLoader__.load({
           clear: clearAnnotations,
           update: (id, note) => updateAnnotation(id, note),
           add: (input) => addAnnotation(input),
-          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor, refineQuoteOrigin },
+          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, locateRange, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor, refineQuoteOrigin },
         }
       },
     }
