@@ -11,6 +11,17 @@ import { readFileSync } from 'node:fs'
 
 const SOURCE = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
 
+/** 浏览器里点「移除」用的是 MouseEvent；测试台只需要它被构造出来（见 removeQuoteChip）。 */
+if (typeof globalThis.MouseEvent !== 'function') {
+  globalThis.MouseEvent = class MouseEvent {
+    constructor(type, init = {}) {
+      this.type = type
+      this.bubbles = init.bubbles === true
+      this.cancelable = init.cancelable === true
+    }
+  }
+}
+
 /** 测试用的「源文件」：第 3 行有引文，且引文外面包着 Markdown 强调标记。 */
 const SOURCE_TEXT = [
   '# 标题',
@@ -58,6 +69,10 @@ function element(tag, attrs = {}, children = []) {
     },
     addEventListener() {},
     removeEventListener() {},
+    dispatchEvent(event) {
+      el.dispatched = [...(el.dispatched ?? []), event]
+      return true
+    },
     focus() {},
     contains(other) {
       if (other === el) return true
@@ -192,6 +207,8 @@ function makeEnvironment() {
   const head = element('head')
   const body = element('body')
   const listeners = new Map()
+  // 引用块 [data-composer-quote] 由用例挂进来：真实 DOM 里它们是 Lexical 装饰节点。
+  let composerChips = []
 
   const document = {
     head,
@@ -211,7 +228,7 @@ function makeEnvironment() {
       }
     },
     querySelector: () => null,
-    querySelectorAll: () => [],
+    querySelectorAll: (selector) => (selector === '[data-composer-quote]' ? composerChips : []),
   }
 
   const loaded = []
@@ -254,6 +271,9 @@ function makeEnvironment() {
     node,
     setRangeRoot(root) {
       rangeRoot = root
+    },
+    setComposerChips(chips) {
+      composerChips = [...chips]
     },
   }
 }
@@ -529,6 +549,10 @@ function makeHarness(options = {}) {
       quoteTexts = [...texts]
       syncSnapshot()
       publish()
+    },
+    /** 挂上「输入框里那条引用」的宿主元素（删除引用靠它里面的官方「移除」按钮）。 */
+    setComposerChips(chips) {
+      env.setComposerChips(chips)
     },
     debug: env.window.__dshSelectionAnnotations,
   }
@@ -1227,3 +1251,47 @@ test('输入态没有引用能力时安静降级：读写引用都不抛错', ()
   assert.deepEqual(harness.debug.quotes(), [], '拿不到投影就当没有引用')
   assert.equal(harness.debug.insertQuote('一段原文'), false, '没有 inputActions 时插引用直接放弃')
 })
+
+/** 造一个引用块：span[data-composer-quote] > button（官方「移除」）。 */
+function makeQuoteChip(harness) {
+  const chip = harness.env.element('span', { 'data-composer-quote': '' })
+  chip.appendChild(harness.env.element('button', { class: 'x' }))
+  return chip
+}
+
+test('删除记录：连输入框里那条引用一起删，靠的是官方「移除」按钮', () => {
+  const harness = makeHarness({ quotes: ['甲段原文'] })
+  const { removeQuoteRecord } = harness.debug._internals
+  const chip = makeQuoteChip(harness)
+  harness.setComposerChips([chip])
+  harness.debug.add({ quote: '甲段原文', note: '改一下', source: { kind: 'quote', text: '甲段原文' } })
+  assert.equal(harness.debug.list().length, 1)
+
+  removeQuoteRecord(harness.debug.list()[0])
+  assert.deepEqual(harness.debug.list(), [], '引用没了，批注也不能留在正文里')
+  const button = chip.querySelector('button')
+  assert.equal(button.dispatched.length, 1, '引用要靠官方「移除」按钮删：插件拿不到 Lexical 的 nodeKey')
+  assert.equal(button.dispatched[0].type, 'click')
+  assert.equal(button.dispatched[0].bubbles, true, '必须冒泡，官方在编辑器里接这次点击')
+})
+
+test('纯引用没有批注也能删：删掉的是输入框里那条引用', () => {
+  const harness = makeHarness({ quotes: ['乙段原文'] })
+  const { removeQuoteChip } = harness.debug._internals
+  const chip = makeQuoteChip(harness)
+  harness.setComposerChips([chip])
+
+  assert.equal(removeQuoteChip(chip), true, '点得到官方按钮就算发出去了')
+  assert.equal(chip.querySelector('button').dispatched.length, 1)
+  assert.deepEqual(harness.debug.list(), [], '纯引用本来就没有批注，删完不该多出记录')
+})
+
+test('找不到引用块时，删除只删批注（消息已发出或引用早被移除）', () => {
+  const harness = makeHarness()
+  const { removeQuoteRecord } = harness.debug._internals
+  harness.debug.add({ quote: '丙段原文', note: 'x', source: { kind: 'message', anchorKey: 'k1' } })
+
+  removeQuoteRecord(harness.debug.list()[0])
+  assert.deepEqual(harness.debug.list(), [], '没有引用块可删，就只删这一条批注')
+})
+

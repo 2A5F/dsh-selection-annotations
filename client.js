@@ -1042,7 +1042,54 @@ window.__ModuleLoader__.load({
           return source
         }
 
-        /** 找一条引用批注对应的引用块：记过的元素优先，其次按引用文本对齐投影顺序。 */
+        /**
+         * 点引用块自带的「移除」按钮 —— 删引用唯一可靠的入口。
+         *
+         * 官方没有公开的 removeQuote：那个按钮最终派发 REMOVE_QUOTE_COMMAND(nodeKey)，
+         * 而 nodeKey 是 Lexical 内部的，插件拿不到。所以不自己动编辑器，直接把这次点击
+         * 交给官方处理（选区、撤销、冻结态都由它兜住）；我们的捕获处理器看到 button 分支
+         * 会顺手忘掉挂在上面的批注。
+         * @param chip - 引用块宿主元素。
+         * @returns 是否真的发出了这次点击。
+         */
+        function clickOfficialRemove(chip) {
+          const button = safe(() => chip?.querySelector('button')) ?? null
+          if (button === null || typeof button.dispatchEvent !== 'function') return false
+          const View = typeof MouseEvent === 'function' ? MouseEvent : null
+          if (View === null) return false
+          button.dispatchEvent(new View('click', { bubbles: true, cancelable: true }))
+          return true
+        }
+
+        /**
+         * 把输入框里的一条引用删掉（原文标记、负载条目会跟着消失）。
+         * @param chip - 引用块宿主元素。
+         */
+        function removeQuoteChip(chip) {
+          if (chip === null || chip === undefined) return false
+          const text = quoteEntries()[quoteChips().indexOf(chip)]?.text
+          const clicked = clickOfficialRemove(chip)
+          // 点击本身走官方捕获链路，也会忘掉批注；这里再显式忘一次（幂等）——
+          // 事件被拦住时也不至于留下一条点不掉的孤儿记录。
+          if (typeof text === 'string') forgetQuoteAnnotation(text)
+          return clicked
+        }
+
+        /**
+         * 删除一条记录。引用和批注是同一条记录 —— 能找回它的引用块就连引用一起删，
+         * 找不回来（引用早被移除、或消息已发出）才只删批注。
+         * @param item - 要删的批注。
+         */
+        function removeQuoteRecord(item) {
+          if (item === null || item === undefined) return
+          const chip = quoteChipOf(item)
+          if (chip !== null) {
+            removeQuoteChip(chip)
+            return
+          }
+          removeAnnotation(item.id)
+        }
+
         /** 引用被移除时，连同挂在它上面的批注一起忘掉（引用和批注是同一条记录的两种形态）。 */
         function forgetQuoteAnnotation(text) {
           if (typeof text !== 'string' || text === '') return
@@ -1053,6 +1100,7 @@ window.__ModuleLoader__.load({
           else scheduleRepaint()
         }
 
+        /** 找一条引用批注对应的引用块：记过的元素优先，其次按引用文本对齐投影顺序。 */
         function quoteChipOf(item) {
           const remembered = item?.quoteAnchor
           if (remembered !== null && remembered !== undefined && remembered.isConnected === true) return remembered
@@ -1851,6 +1899,8 @@ window.__ModuleLoader__.load({
         let popoverMode = 'create'
         let popoverAnchor = null
         let popoverTargetId = null
+        /** 这次弹层对应的引用块（纯引用没有批注 id，删掉它靠的就是这个元素）。 */
+        let popoverChip = null
 
         function showPopover(options) {
           const noteMode = options.mode === 'note' || options.mode === 'note-edit'
@@ -1867,7 +1917,12 @@ window.__ModuleLoader__.load({
           popInput.placeholder = noteMode ? '添加可选评论…' : '写点什么（可以留空，只标记原文）'
           popoverMode = options.mode
           popoverTargetId = options.targetId ?? null
-          popDelete.style.display = options.mode === 'edit' ? '' : 'none'
+          // 「删除」= 删掉整条记录（引用块 + 描述），不是只抹掉描述；纯引用也能从这里删。
+          const canDelete = options.mode === 'edit' || (noteMode && options.canDeleteQuote === true)
+          popDelete.style.display = canDelete ? '' : 'none'
+          popDelete.textContent = options.mode === 'edit' ? '删除' : '删除引用'
+          popDelete.title =
+            options.mode === 'edit' ? '删掉这条记录，输入框里的引用一起移除' : '把这条引用从输入框里删掉'
           // 引用批注：新建时「跳过」就是点别处（不建批注）；已经有批注时，那个位置给「删除批注」。
           if (noteMode) {
             const canDelete = options.mode === 'note-edit'
@@ -1942,6 +1997,7 @@ window.__ModuleLoader__.load({
           const existing = annotationOnQuote(text, fallbackSource)
           const source = existing?.source ?? fallbackSource
           popoverAnchor = existing === undefined ? { quote: text, source, range: null, chip } : null
+          popoverChip = chip
           showPopover({
             title: '',
             quote: '',
@@ -1950,6 +2006,8 @@ window.__ModuleLoader__.load({
             rect: rect ?? safe(() => chip.getBoundingClientRect()),
             mode: existing === undefined ? 'note' : 'note-edit',
             targetId: existing?.id ?? null,
+            // 纯引用没有批注可删，但「这条引用不想要了」也得能从弹层里删掉。
+            canDeleteQuote: true,
           })
         }
 
@@ -2080,6 +2138,8 @@ window.__ModuleLoader__.load({
               bottom: window.innerHeight / 2,
             }
           popoverAnchor = null
+          // 角标点开的是这条记录本身：它有引用块时，「删除」就连引用一起删。
+          popoverChip = null
           showPopover({
             title: `修改批注 #${item.number}`,
             quote: item.quote,
@@ -2095,6 +2155,7 @@ window.__ModuleLoader__.load({
           popover.dataset.open = '0'
           popoverAnchor = null
           popoverTargetId = null
+          popoverChip = null
           popoverMode = 'create'
         }
 
@@ -2257,8 +2318,23 @@ window.__ModuleLoader__.load({
 
         function deleteFromPopover() {
           const target = popoverTargetId
+          const chip = popoverChip
           closePopover()
-          if (target !== null) removeAnnotation(target)
+          if (target !== null) {
+            const item = annotations.find((entry) => entry.id === target)
+            if (item !== undefined) {
+              removeQuoteRecord(item)
+              return
+            }
+            if (chip !== null) {
+              removeQuoteChip(chip)
+              return
+            }
+            removeAnnotation(target)
+            return
+          }
+          // 纯引用：删的就是输入框里那条引用，原文标记随之消失。
+          if (chip !== null) removeQuoteChip(chip)
         }
 
         annotateButton.addEventListener('mousedown', (event) => {
@@ -2407,7 +2483,8 @@ window.__ModuleLoader__.load({
             summary.title = summary.textContent
             head.appendChild(summary)
             head.appendChild(button('sa-link', '编辑', () => openEditPopover(item.id, head)))
-            head.appendChild(button('sa-link', '删除', () => removeAnnotation(item.id)))
+            // 删除 = 删掉整条记录：输入框里那条引用也一起移除（引用即记录）。
+            head.appendChild(button('sa-link', '删除', () => removeQuoteRecord(item)))
             row.appendChild(head)
             // 引用来源的原文带着「【path:行号】」来路行，面板里只显示原文，出处由上面的摘要负责。
             const shownQuote = item.source?.kind === 'quote' ? quoteExcerptOf(item.quote) : item.quote
@@ -2626,7 +2703,7 @@ window.__ModuleLoader__.load({
           clear: clearAnnotations,
           update: (id, note) => updateAnnotation(id, note),
           add: (input) => addAnnotation(input),
-          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, locateRange, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor, refineQuoteOrigin },
+          _internals: { buildPayload, payloadItems, payloadSource, describeSource, captureSource, matchInRoot, locateRange, rangeFromOffsets, offsetRange, anchorRoot, locateInSource, lineOfOffset, resolveSourcePosition, refineSourcePosition, quoteBody, quoteOriginLine, quoteExcerptOf, annotationOnQuote, quoteAnnotationSource, quoteSourceAnchor, inferQuoteSource, quoteSourceFor, refineQuoteOrigin, clickOfficialRemove, removeQuoteChip, removeQuoteRecord },
         }
       },
     }
